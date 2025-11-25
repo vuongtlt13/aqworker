@@ -1,0 +1,6 @@
+# AQWorker package (install from parent directory)
+-e ../../
+
+# Redis client for job queue
+redis>=5.0.0
+

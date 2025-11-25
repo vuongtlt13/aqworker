@@ -1,0 +1,8 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+redis>=5.0.0
+httpx>=0.25.0
+
+# Install aqworker from the parent directory
+# pip install -e ../../
