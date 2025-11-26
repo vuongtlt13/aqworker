@@ -28,7 +28,7 @@ class JobQueue:
         """
         # Store URL for lazy connection
         self.redis_url = redis_url
-        self._redis_client = None
+        self._redis_client = redis.from_url(self.redis_url, decode_responses=True)
         self.queue_prefix = JOB_QUEUE_PREFIX
 
         self.processing_queue = PROCESSING_QUEUE
