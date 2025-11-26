@@ -1,6 +1,6 @@
 [project]
 name = "aqworker"
-version = "0.1.2"
+version = "0.1.3"
 description = "Async Redis-backed job runner for Python apps. AQWorker orchestrates workers, handlers, and queues with auto-discovery, retries, CLI tooling, and FastAPI-friendly async processing while staying framework agnostic."
 readme = "README.md"
 requires-python = ">=3.10, <4.0"

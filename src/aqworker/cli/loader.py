@@ -45,7 +45,7 @@ def load_aqworker_from_file(file_path: str) -> AQWorker:
 
     # Convert path to module path
     # e.g., examples/simple/aq_worker.py -> examples.simple.aq_worker
-    module_name = abs_path.stem
+    module_name = str(file_path).replace(".py", "").replace("/", ".").replace("\\", ".")
 
     # Load the module
     spec = importlib.util.spec_from_file_location(module_name, abs_path)
@@ -55,7 +55,7 @@ def load_aqworker_from_file(file_path: str) -> AQWorker:
     module = importlib.util.module_from_spec(spec)
 
     # Add parent directory to sys.path if needed for imports
-    parent_dir = str(abs_path.parent)
+    parent_dir = str(Path.cwd())
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 
