@@ -41,7 +41,7 @@ def list_queue_names(aq_worker: AQWorker) -> List[str]:
 
 def build_worker(aq_worker: AQWorker, worker_name: str) -> "BaseWorker":
     """Construct an aq_worker instance without starting it."""
-    return aq_worker.create_worker(worker_name)  # type: ignore[no-any-return]
+    return aq_worker.create_worker(worker_name)
 
 
 def run_worker(aq_worker: AQWorker, worker_name: str) -> None:

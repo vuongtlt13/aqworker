@@ -8,7 +8,6 @@ from abc import ABC
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from aqworker.handler.registry import HandlerRegistry
 from aqworker.job.models import Job
 from aqworker.job.service import JobService
 from aqworker.logger import logger

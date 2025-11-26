@@ -15,7 +15,7 @@ from aqworker.worker.dispatcher import HandlerDispatcher
 from aqworker.worker.registry import WorkerRegistry
 
 if TYPE_CHECKING:
-    from worker.base import BaseWorker
+    from aqworker.worker.base import BaseWorker
 
 
 class AQWorker:
