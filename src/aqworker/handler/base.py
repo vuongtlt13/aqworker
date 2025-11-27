@@ -6,6 +6,11 @@ class BaseHandler(ABC):
     """Abstract base for job handlers."""
 
     name: Optional[str] = None
+    queue_name: Optional[str] = None
+
+    @classmethod
+    def cron(cls) -> Optional[str]:
+        return None
 
     @classmethod
     def get_name(cls) -> str:

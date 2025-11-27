@@ -16,7 +16,13 @@ This includes `httpx`, which is used by the sample client script.
 
 ### 1. Start the FastAPI server
 
-Run the application using uvicorn:
+First change into this example directory:
+
+```bash
+cd examples/simple_fastapi
+```
+
+Then run the application using uvicorn:
 
 ```bash
 uvicorn main:app --reload
@@ -27,9 +33,9 @@ The API will be available at:
 - Interactive API docs (Swagger UI): http://localhost:8000/docs
 - Alternative API docs (ReDoc): http://localhost:8000/redoc
 
-### 2. Start a worker
+### 2. Start queue workers
 
-In a separate terminal, run a worker to process jobs. You can use either the CLI or the Python script:
+In another terminal, also `cd examples/simple_fastapi`, then run workers to process `Job` handlers. You can use either the CLI or the Python runner:
 
 #### Using AQWorker CLI
 
@@ -41,6 +47,9 @@ aqworker start email examples/simple_fastapi/worker.py
 
 # Start notification worker
 aqworker start notification examples/simple_fastapi/worker.py
+
+# Start cron worker (handles CronJob queue)
+aqworker start cron examples/simple_fastapi/worker.py
 
 # List available workers
 aqworker list:aq_worker examples/simple_fastapi/worker.py
@@ -58,6 +67,7 @@ export AQWORKER_FILE=examples/simple_fastapi/worker.py
 # Now use commands without specifying the file path
 aqworker start email
 aqworker start notification
+aqworker start cron
 aqworker list:aq_worker
 aqworker stats emails
 ```
@@ -70,9 +80,54 @@ python worker_runner.py email
 
 # Or run notification worker
 python worker_runner.py notification
+
+# (Cron worker is best run via the CLI so you can have separate processes.)
 ```
 
-### 3. Trigger jobs via the sample client
+### 3. (Optional) Start the cron scheduler (beat)
+
+Cron jobs (`CronJob` subclasses) require the `CronScheduler`. When you run the FastAPI app, the scheduler is started via the lifespan context (see `main.py`). If you want to run it separately—e.g., without the API—you can use the CLI:
+
+```bash
+# Using file argument
+cd examples/simple_fastapi
+aqworker beat examples/simple_fastapi/worker.py --check-interval 0.5
+
+# Or rely on AQWORKER_FILE
+export AQWORKER_FILE=examples/simple_fastapi/worker.py
+aqworker beat
+
+# Prefer Python instead of CLI? Use the helper script (wraps the same CLI logic)
+python run_beat.py --check-interval 0.5
+```
+
+Each `CronJob` must define `queue_name` and a `cron()` expression (5- or 6-field cron). The scheduler defaults to a 0.1s check interval to support second-level expressions (e.g., `"*/10 * * * * *"`).
+
+### Cron job demo
+
+`handlers.py` defines two `CronJob` classes:
+
+- `DailyReportCronJob` (`queue_name="cron"`, cron: `*/10 * * * * *`) generates reports every 10 seconds for demo purposes.
+- `HealthCheckCronJob` (`queue_name="cron"`, cron: `*/10 * * * * *`) performs a health check every 10 seconds.
+
+Once the `cron` worker (step 2) and the scheduler/beat (step 3) are running, you'll see log lines from these cron jobs even if no API calls are happening.
+
+> ### Cron expression primer
+>
+> AQWorker automatically detects whether your cron expression has 5 fields (minute-level) or 6 fields (seconds-level). When it has six fields we call `croniter(..., second_at_beginning=True)` which means the **first token represents seconds**. Examples:
+>
+> | Cadence               | Expression        | Notes                                                     |
+> |-----------------------|-------------------|-----------------------------------------------------------|
+> | Every 10 seconds      | `*/10 * * * * *`  | Seconds field first. Runs at 0s, 10s, 20s, ...            |
+> | Every minute at zero  | `0 * * * * *`     | Six-field variant of “top of every minute.”               |
+> | Every 5 minutes       | `*/5 * * * *`     | Classic 5-field expression (minutes).                     |
+> | Weekdays at 09:00     | `0 9 * * MON-FRI` | No seconds field; standard cron.                          |
+>
+> **Reminder:** make sure you really mean to use seconds when supplying six fields. A misplaced sixth token can make your cron job run far more frequently than intended.
+
+### 4. Trigger jobs via the sample client
+
+From a new terminal (also in `examples/simple_fastapi`):
 
 With the FastAPI server running on `http://localhost:8000`, execute:
 
@@ -147,10 +202,11 @@ curl "http://localhost:8000/jobs/queues/emails/stats"
 
 ## Architecture
 
-- **AQWorker**: Main instance managing workers, handlers, and job service
-- **Workers**: Background processes that consume jobs from queues
-- **Handlers**: Business logic for processing specific job types
-- **JobService**: Manages job queue operations (enqueue, dequeue, stats)
+- **Jobs (`Job`)**: One-off handlers (e.g., `EmailJob`, `NotificationJob`). Each class must set `name` and `queue_name`.
+- **Cron jobs (`CronJob`)**: Scheduled handlers (`DailyReportCronJob`, `HealthCheckCronJob`) that expose `cron()` expressions. Enqueued automatically by `CronScheduler` or the `aqworker beat` CLI.
+- **AQWorker**: Manages the handler registry, worker registry, and the shared `JobService`.
+- **Workers**: Background consumers for specific queue sets (`EmailWorker`, `NotificationWorker`, `CronWorker`).
+- **JobService**: Talks to Redis for enqueue/dequeue/stats.
 
 ## Project Structure
 
@@ -167,6 +223,7 @@ simple_fastapi/
 ```
 
 `worker.py` configures `AQWorker(include_packages=["examples.simple_fastapi.handlers"])`,
-so any handler classes you add under `handlers.py` (or submodules) are registered
-automatically. Decorator-based handlers remain supported—just import the module or add it
-to `include_packages` so the decorator executes.
+so every subclass of `Job`/`CronJob` in `handlers.py` is auto-registered as long as it sets
+`name` and `queue_name`. Prefer decorators? Use `@aq_worker.job(queue_name="...")` or
+`@aq_worker.cronjob(cron="*/5 * * * * *", queue_name="...")` and ensure the module gets
+imported so registration runs.

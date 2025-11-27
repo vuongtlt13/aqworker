@@ -87,11 +87,14 @@ AQWorker is a Redis-based background job processing system for Python applicatio
   - Error handling and retries
   - Health monitoring
 
-### 7. BaseHandler (`handler/base.py`)
-- **Purpose**: Base class for all job handlers
+### 7. Job & CronJob (`job/base.py`)
+- **Purpose**: Base classes for job handlers
+- **Job**: For one-time jobs
+- **CronJob**: For scheduled/recurring jobs with cron expressions
 - **Features**:
   - Async/sync handler support
   - Standardized job processing interface
+  - Required `queue_name` attribute
 
 ## Installation
 
@@ -111,12 +114,15 @@ pip install -e .
 
 ### 1. Define Handlers
 
+**Method 1: Using Job class (for one-time jobs)**
+
 ```python
 # handlers.py
-from aqworker import BaseHandler
+from aqworker import Job
 
-class EmailHandler(BaseHandler):
+class EmailJob(Job):
     name = "email"
+    queue_name = "emails"  # Required: specify which queue this job uses
     
     async def handle(self, data: dict) -> bool:
         recipient = data.get("recipient")
@@ -128,8 +134,51 @@ class EmailHandler(BaseHandler):
         return True
 ```
 
-You can still use the `@aq_worker.handler` decorator for function-based handlers—just make
-sure the module containing the decorator is imported so the handler gets registered.
+**Method 2: Using CronJob class (for scheduled jobs)**
+
+```python
+from aqworker import CronJob
+
+class DailyReportCronJob(CronJob):
+    name = "daily_report"
+    queue_name = "reports"  # Required: specify which queue this job uses
+    
+    @classmethod
+    def cron(cls) -> str:
+        """Cron expression: run daily at midnight."""
+        return "0 0 * * *"
+    
+    async def handle(self, data: dict) -> bool:
+        # Generate daily report
+        print("Generating daily report...")
+        return True
+```
+
+**Method 3: Using decorators**
+
+```python
+from aqworker import AQWorker
+
+aq_worker = AQWorker()
+
+# Job decorator (one-time jobs)
+@aq_worker.job(name='send_email', queue_name='emails')  # queue_name is required
+async def send_email(data: dict) -> bool:
+    recipient = data.get("recipient")
+    print(f"Sending email to {recipient}")
+    return True
+
+# CronJob decorator (scheduled jobs)
+@aq_worker.cronjob(cron='0 0 * * *', name='daily_report', queue_name='reports')  # queue_name is required
+async def daily_report(data: dict) -> bool:
+    print("Generating daily report...")
+    return True
+```
+
+**Important Notes:**
+- `queue_name` is **required** for all handlers (Job, CronJob, or decorators)
+- Each handler must specify which queue it uses
+- If you override `queue_name` when enqueueing, you'll get a warning
 
 ### 2. Define Workers
 
@@ -161,11 +210,11 @@ job_service = JobService()
 # Initialize AQWorker and auto-import handlers package
 aq_worker = AQWorker(include_packages=["handlers"])
 
-# Register workers and handlers
+# Register workers
 aq_worker.register_worker(EmailWorker)
-# Handlers inside "handlers" will be discovered automatically, but you can still
-# register manually if desired:
-# aq_worker.register_handler(EmailHandler)
+# Handlers inside "handlers" will be discovered automatically (Job, CronJob, or decorators)
+# You can still register manually if desired:
+# aq_worker.register_handler(EmailJob)
 
 # Connect job service
 aq_worker.listen(job_service)
@@ -175,8 +224,8 @@ aq_worker.listen(job_service)
 
 If your handlers are spread across multiple modules, you can tell `AQWorker` to
 import them automatically by passing `include_packages`. Every module inside
-those packages will be imported once at startup, so any `@aq_worker.handler`
-decorators (or subclasses of `BaseHandler`) run and register themselves:
+those packages will be imported once at startup, so any `@aq_worker.job` or
+`@aq_worker.cronjob` decorators (or subclasses of `Job`/`CronJob`) run and register themselves:
 
 ```python
 aq_worker = AQWorker(include_packages=[
@@ -195,15 +244,32 @@ full list of available handlers so you can confirm everything loaded correctly.
 # In your application
 from worker import aq_worker
 
-# Enqueue a job
+# Method 1: Using handler class (queue_name is taken from handler)
 job = await aq_worker.job_service.enqueue_job(
-    queue_name="emails",
-    handler="email",
+    handler=EmailJob,  # queue_name is automatically taken from EmailJob.queue_name
     data={
         "recipient": "user@example.com",
         "subject": "Welcome!",
         "body": "Welcome to our service!"
     }
+)
+
+# Method 2: Using handler name (queue_name must be provided)
+job = await aq_worker.job_service.enqueue_job(
+    handler="email",
+    queue_name="emails",  # Required when handler is a string
+    data={
+        "recipient": "user@example.com",
+        "subject": "Welcome!",
+        "body": "Welcome to our service!"
+    }
+)
+
+# Method 3: Override queue_name (will log a warning if different from handler's queue_name)
+job = await aq_worker.job_service.enqueue_job(
+    handler=EmailJob,
+    queue_name="other_queue",  # Warning: overrides EmailJob.queue_name
+    data={...}
 )
 ```
 
@@ -233,6 +299,59 @@ async def main():
 asyncio.run(main())
 ```
 
+### 6. Run Cron Scheduler (Beat)
+
+If you have CronJob handlers, you need to run the beat service to schedule them. The beat service automatically checks cron expressions and enqueues jobs when they match.
+
+**Using CLI:**
+
+```bash
+# Start beat service
+aqworker beat aq_worker.py
+
+# With custom options
+aqworker beat aq_worker.py --check-interval 0.1
+
+# Using environment variable
+export AQWORKER_FILE=aq_worker.py
+aqworker beat
+```
+
+> ### 🔔 Cron expression primer  
+> AQWorker supports both classic 5-field cron strings (`minute hour day month weekday`) and 6-field strings that include seconds. When we detect six fields we call `croniter(..., second_at_beginning=True)` so the **first slot is the seconds field**. Double-check your syntax:
+>
+> | Cadence               | Expression        | Meaning                                                   |
+> |-----------------------|-------------------|-----------------------------------------------------------|
+> | Every 10 seconds      | `*/10 * * * * *`  | 6-field format. `*/10` sits in the seconds field.         |
+> | Every minute at 0 sec | `0 * * * * *`     | Fires once per minute exactly at the top of the minute.   |
+> | Every 5 minutes       | `*/5 * * * *`     | Classic 5-field format on the minutes column.             |
+> | Weekdays at 09:00     | `0 9 * * MON-FRI` | Standard cron with no seconds column.                     |
+>
+> **Caution:** If you accidentally supply six fields when you intended five, your job may run every few seconds instead of every few minutes. Always review the first token—when there are six tokens, it is the seconds slot.
+
+**Using Python:**
+
+```python
+from aqworker import AQWorker, CronScheduler
+
+aq_worker = AQWorker(include_packages=["handlers"])
+
+# Create and start cron scheduler
+cron_scheduler = CronScheduler(
+    handler_registry=aq_worker.handler_registry,
+    job_service=aq_worker.job_service,
+    # check_interval defaults to 0.1 seconds (supports second-level cron)
+)
+
+await cron_scheduler.start()
+```
+
+**Important Notes:**
+- Each CronJob must have `queue_name` defined (required)
+- Beat service runs independently from workers
+- Supports both 5-field (minute-level) and 6-field (second-level) cron expressions
+- Default check interval is 0.1 seconds for better precision
+
 ## Usage Examples
 
 ### Standalone Python Application
@@ -246,8 +365,8 @@ async def main():
     # Enqueue jobs
     for i in range(10):
         job = await aq_worker.job_service.enqueue_job(
-            queue_name="emails",
             handler="email",
+            queue_name="emails",
             data={"recipient": f"user{i}@example.com", "subject": f"Email {i}"}
         )
         print(f"Enqueued job: {job.id}")
@@ -305,8 +424,8 @@ import asyncio
 
 async def send_email_view(request):
     job = await aq_worker.job_service.enqueue_job(
-        queue_name="emails",
         handler="email",
+        queue_name="emails",
         data={
             "recipient": request.POST.get("recipient"),
             "subject": request.POST.get("subject"),
@@ -445,9 +564,9 @@ Redis Keys:
 ### Custom Job Data
 
 ```python
+# Using handler class (queue_name from handler)
 job = await aq_worker.job_service.enqueue_job(
-    queue_name="emails",
-    handler="email",
+    handler=EmailJob,  # queue_name automatically taken from EmailJob.queue_name
     data={
         "recipient": "user@example.com",
         "subject": "Welcome",
@@ -462,6 +581,14 @@ job = await aq_worker.job_service.enqueue_job(
     },
     max_retries=5,
     retry_delay=60
+)
+
+# Or using handler name (queue_name required)
+job = await aq_worker.job_service.enqueue_job(
+    handler="email",
+    queue_name="emails",  # Required when handler is a string
+    data={...},
+    metadata={...}
 )
 ```
 
@@ -481,8 +608,9 @@ await worker.run()
 ### Handler with Async Support
 
 ```python
-class AsyncHandler(BaseHandler):
+class AsyncJob(Job):
     name = "async_task"
+    queue_name = "async_tasks"  # Required
     
     async def handle(self, data: dict) -> bool:
         # Async operations
@@ -511,10 +639,12 @@ class AsyncHandler(BaseHandler):
 - Balance load across workers
 
 ### 4. Handler Design
+- **Required**: All handlers (Job, CronJob) must define `queue_name` attribute
 - Make handlers idempotent when possible
 - Handle errors gracefully
 - Return `True` on success, `False` on failure
 - Use async handlers for I/O operations
+- Use `Job` for one-time jobs, `CronJob` for scheduled/recurring jobs
 
 ## Troubleshooting
 

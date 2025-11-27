@@ -11,6 +11,7 @@ import signal
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import suppress
 
 from worker import aq_worker
 
@@ -37,8 +38,8 @@ def enqueue_email_jobs():
             # Use run_coroutine_threadsafe to run coroutine in main thread's event loop
             future = asyncio.run_coroutine_threadsafe(
                 aq_worker.job_service.enqueue_job(
-                    queue_name="emails",
                     handler="email",
+                    queue_name="emails",
                     data={
                         "recipient": f"user{job_counter}@example.com",
                         "subject": f"Email #{job_counter}",
@@ -74,8 +75,17 @@ def signal_handler(sig, frame):
     running = False
 
 
+async def _run_worker(worker_name: str):
+    """Helper to create and run a worker."""
+    worker = aq_worker.create_worker(worker_name)
+    print(f"[Main] Starting {worker_name} worker...")
+    print(f"[Main] Queues: {worker.queue_names}")
+    print()
+    await worker.run()
+
+
 async def main():
-    """Main function that runs the email aq_worker."""
+    """Main function that runs the email and cron workers."""
     global running, main_loop
 
     # Store the event loop for the background thread
@@ -85,7 +95,7 @@ async def main():
     print("AQWorker Simple Example")
     print("=" * 60)
     print()
-    print("Starting email aq_worker and enqueue thread...")
+    print("Starting email + cron workers and enqueue thread...")
     print("Press Ctrl+C to stop\n")
 
     # Start background thread for enqueueing jobs
@@ -95,15 +105,14 @@ async def main():
     # Give the thread a moment to start
     await asyncio.sleep(0.5)
 
-    # Create and run email aq_worker in main thread
+    # Create and run workers concurrently (email + cron)
+    worker_tasks = []
     try:
-        email_worker = aq_worker.create_worker("email")
-        print(f"[Main] Starting email aq_worker...")
-        print(f"[Main] Queues: {email_worker.queue_names}")
-        print()
+        worker_tasks.append(asyncio.create_task(_run_worker("email")))
+        worker_tasks.append(asyncio.create_task(_run_worker("cron")))
 
-        # Run the aq_worker (this will block until interrupted)
-        await email_worker.run()
+        # Wait for workers to finish (until interrupted)
+        await asyncio.gather(*worker_tasks)
 
     except KeyboardInterrupt:
         print("\n[Main] Worker interrupted")
@@ -112,6 +121,11 @@ async def main():
     finally:
         running = False
         print("[Main] Shutting down...")
+        # Cancel worker tasks gracefully
+        for task in worker_tasks:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 if __name__ == "__main__":

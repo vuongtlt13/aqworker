@@ -5,7 +5,7 @@ import pytest
 
 from aqworker.constants import get_job_status_key
 from aqworker.handler import BaseHandler
-from aqworker.job.models import Job, JobCreateRequest, JobStatus
+from aqworker.job.models import JobCreateRequest, JobModel, JobStatus
 from aqworker.job.service import JobService
 
 
@@ -121,7 +121,7 @@ class NamedHandler(BaseHandler):
 @pytest.mark.asyncio
 async def test_enqueue_job_accepts_handler_class(job_service):
     service, queue = job_service
-    job = await service.enqueue_job("tasks", NamedHandler, data={"value": 1})
+    job = await service.enqueue_job(NamedHandler, queue_name="tasks", data={"value": 1})
     assert job.handler == "named-handler"
     assert queue.enqueued_jobs[-1] == job.id
 
@@ -192,7 +192,7 @@ async def test_retry_job_respects_budget(job_service):
 async def test_cleanup_old_jobs_removes_entries(job_service):
     service, queue = job_service
     old_time = datetime.now(timezone.utc) - timedelta(days=8)
-    completed_job = Job(
+    completed_job = JobModel(
         id="completed",
         handler="h",
         queue_name="tasks",
@@ -212,7 +212,7 @@ async def test_cleanup_old_jobs_removes_entries(job_service):
 @pytest.mark.asyncio
 async def test_get_next_job_and_complete(job_service):
     service, queue = job_service
-    queue.next_job = Job(id="next", handler="h", queue_name="tasks")
+    queue.next_job = JobModel(id="next", handler="h", queue_name="tasks")
 
     job = await service.get_next_job(["tasks"], timeout=1, worker_id="w1")
     assert job.id == "next"

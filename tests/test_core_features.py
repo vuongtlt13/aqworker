@@ -39,11 +39,11 @@ def test_get_available_workers_caches_registry():
 async def test_handler_decorator_registers_sync_and_async_handlers():
     worker = AQWorker()
 
-    @worker.handler("sync_task")
+    @worker.job("sync_task", queue_name="sync_queue")
     def sync_handler(payload):
         return True
 
-    @worker.handler("async_task")
+    @worker.job("async_task", queue_name="async_queue")
     async def async_handler(payload):
         return True
 

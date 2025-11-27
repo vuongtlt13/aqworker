@@ -8,7 +8,7 @@ from abc import ABC
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from aqworker.job.models import Job
+from aqworker.job.models import JobModel
 from aqworker.job.service import JobService
 from aqworker.logger import logger
 from aqworker.worker.dispatcher import HandlerDispatcher
@@ -135,7 +135,7 @@ class BaseWorker(ABC):
             and not self.shutdown_requested
         )
 
-    async def _process_job_async(self, job: Job):
+    async def _process_job_async(self, job: JobModel):
         """Process a single job asynchronously."""
         job_id = job.id
         self.running_jobs.add(job_id)
@@ -273,7 +273,7 @@ class BaseWorker(ABC):
         except Exception as e:
             logger.error(f"Failed to log periodic stats: {e}")
 
-    async def _retry_or_fail(self, job: Job, error_message: str):
+    async def _retry_or_fail(self, job: JobModel, error_message: str):
         """Complete job as failed; retry if allowed, with delay."""
         try:
             # Mark as failed first so status/history is consistent

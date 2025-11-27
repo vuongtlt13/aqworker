@@ -18,14 +18,14 @@ def worker_registry():
 
 
 def test_subclass_auto_registers_with_declared_name(handler_registry: HandlerRegistry):
-    class EmailHandler(BaseHandler):
+    class EmailJob(BaseHandler):
         name = "email_handler"
 
         def handle(self, data):
             return True
 
-    handler_registry.register(EmailHandler)
-    assert handler_registry.get("email_handler") is EmailHandler
+    handler_registry.register(EmailJob)
+    assert handler_registry.get("email_handler") is EmailJob
 
 
 def test_duplicate_handler_names_raise_value_error(handler_registry: HandlerRegistry):

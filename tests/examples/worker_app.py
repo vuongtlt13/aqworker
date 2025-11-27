@@ -10,7 +10,7 @@ from tests.examples.workers import priority_worker, sample_worker
 aq_worker = AQWorker()
 aq_worker.register_worker(sample_worker.BackgroundWorker)
 aq_worker.register_worker(priority_worker.PriorityWorker)
-aq_worker.register_handler(email_handler_module.EmailHandler)
+aq_worker.register_handler(email_handler_module.EmailJob)
 aq_worker.register_handler(sms_handler_module.SmsHandler)
 
 __all__ = ["aq_worker"]

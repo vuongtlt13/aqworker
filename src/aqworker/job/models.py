@@ -16,7 +16,7 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class Job(BaseModel):
+class JobModel(BaseModel):
     """Background job model."""
 
     id: str = Field(default=..., description="Unique job identifier")
@@ -42,6 +42,10 @@ class Job(BaseModel):
     )
     scheduled_at: Optional[datetime] = Field(
         default=None, description="Scheduled execution time"
+    )
+    schedule_time: Optional[datetime] = Field(
+        default=None,
+        description="Cron schedule timestamp that triggered this job (if applicable)",
     )
     started_at: Optional[datetime] = Field(default=None, description="Job start time")
     completed_at: Optional[datetime] = Field(
@@ -80,6 +84,7 @@ class JobCreateRequest(BaseModel):
     )
     metadata: Dict[str, Any] = Field(default_factory=dict)
     scheduled_at: Optional[datetime] = None
+    schedule_time: Optional[datetime] = None
     max_retries: int = 3
     retry_delay: float = 60
 
@@ -98,4 +103,4 @@ class JobResponse(BaseModel):
 
     success: bool
     message: str
-    data: Optional[Job] = None
+    data: Optional[JobModel] = None

@@ -11,7 +11,7 @@ def aq_worker():
     worker = AQWorker()
     worker.register_worker(sample_worker.BackgroundWorker)
     worker.register_worker(priority_worker.PriorityWorker)
-    worker.register_handler(email.EmailHandler)
+    worker.register_handler(email.EmailJob)
     worker.register_handler(sms.SmsHandler)
     return worker
 
@@ -28,7 +28,7 @@ def test_list_worker_names_empty():
 def test_list_handler_descriptors(aq_worker):
     descriptors = cli_cmds.list_handler_descriptors(aq_worker)
     assert descriptors == [
-        ("email", "tests.examples.handlers.email.EmailHandler"),
+        ("email", "tests.examples.handlers.email.EmailJob"),
         ("sms", "tests.examples.handlers.sms.SmsHandler"),
     ]
 

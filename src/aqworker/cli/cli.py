@@ -17,29 +17,30 @@ from aqworker.cli.commands import (
     list_handler_descriptors,
     list_queue_names,
     list_worker_names,
+    run_beat,
     run_worker,
 )
 from aqworker.cli.loader import get_aqworker_file, load_aqworker_from_file
+from aqworker.constants import DEFAULT_CRON_CHECK_INTERVAL
 from aqworker.core import AQWorker
 
 app = typer.Typer(name="aqworker", help="AQWorker management CLI")
 
-# Create a default AQWorker instance for CLI
-# Users should register workers/handlers before using CLI commands
-_default_aq_worker = AQWorker()
-
 
 def _get_aqworker_instance(file_path: Optional[str] = None) -> AQWorker:
     """
-    Get AQWorker instance from file or use default.
+    Get AQWorker instance from file.
 
     Args:
         file_path: Optional path to Python file containing AQWorker instance
 
     Returns:
         AQWorker instance
+
+    Raises:
+        typer.Exit: If AQWorker instance is not found
     """
-    # Priority: file_path argument > env variable > default
+    # Priority: file_path argument > env variable
     if file_path:
         try:
             return load_aqworker_from_file(file_path)
@@ -57,7 +58,15 @@ def _get_aqworker_instance(file_path: Optional[str] = None) -> AQWorker:
             )
             raise typer.Exit(code=1) from e
 
-    return _default_aq_worker
+    # No AQWorker instance found
+    typer.echo(
+        "Error: AQWorker instance not found.\n"
+        "Please provide a file path or set AQWORKER_FILE environment variable.\n"
+        "Example: aqworker start email worker.py\n"
+        "Or: export AQWORKER_FILE=worker.py && aqworker start email",
+        err=True,
+    )
+    raise typer.Exit(code=1)
 
 
 def _handle_registry_error(func):
@@ -174,6 +183,50 @@ def queue_stats(
         typer.echo(f"  Failed:     {stats.get('failed', 0)}")
 
     _impl()
+
+
+@app.command("beat")
+def start_beat(
+    file_path: Optional[str] = typer.Argument(
+        None, help="Path to Python file containing AQWorker instance"
+    ),
+    check_interval: Optional[float] = typer.Option(
+        None,
+        "--check-interval",
+        "-i",
+        help="Interval in seconds to check for cron jobs (default: 0.1)",
+    ),
+):
+    """
+    Start the cron scheduler (beat service).
+
+    This command runs a background service that periodically checks registered
+    CronJob handlers and enqueues jobs when their cron expressions match.
+
+    Note: Each CronJob must have queue_name defined (required).
+
+    Example:
+        aqworker beat worker.py
+        aqworker beat worker.py --check-interval 0.5
+    """
+
+    @_handle_registry_error
+    def _impl():
+        aq_worker = _get_aqworker_instance(file_path)
+        run_beat(
+            aq_worker=aq_worker,
+            check_interval=check_interval or DEFAULT_CRON_CHECK_INTERVAL,
+        )
+
+    try:
+        _impl()
+    except typer.Exit:
+        raise
+    except KeyboardInterrupt:
+        typer.echo("Beat interrupted, shutting down...")
+    except Exception as exc:  # pragma: no cover
+        typer.echo(f"Failed to run beat: {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":

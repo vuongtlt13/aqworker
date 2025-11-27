@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from aqworker.job.models import Job
+from aqworker.job.models import JobModel
 from aqworker.worker.base import BaseWorker, WorkerConfig
 
 
@@ -53,7 +53,7 @@ def make_job(**overrides):
         "data": {"value": 1},
     }
     defaults.update(overrides)
-    return Job(**defaults)
+    return JobModel(**defaults)
 
 
 def test_worker_uses_class_config_and_overrides():

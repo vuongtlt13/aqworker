@@ -12,7 +12,7 @@ from aqworker.constants import (
     get_job_status_key,
     get_queue_name,
 )
-from aqworker.job.models import Job, JobStatus
+from aqworker.job.models import JobModel, JobStatus
 from aqworker.logger import logger
 
 
@@ -49,7 +49,7 @@ class JobQueue:
         """Get queue name for specific queue."""
         return get_queue_name(queue_name)
 
-    async def enqueue(self, job: Job) -> bool:
+    async def enqueue(self, job: JobModel) -> bool:
         """
         Add job to queue.
 
@@ -85,7 +85,7 @@ class JobQueue:
 
     async def dequeue(
         self, queue_names: List[str], timeout: int = 0, worker_id: Optional[str] = None
-    ) -> Optional[Job]:
+    ) -> Optional[JobModel]:
         """
         Get next job from queue (FIFO) using atomic operations to prevent race conditions.
 
@@ -118,7 +118,7 @@ class JobQueue:
                         continue
 
                 if job_data:
-                    job = Job.model_validate_json(job_data)
+                    job = JobModel.model_validate_json(job_data)
 
                     # Try to acquire job lock to prevent duplicate processing
                     if worker_id and not await self._acquire_job_lock(
@@ -240,7 +240,7 @@ class JobQueue:
             logger.error(f"Failed to release job lock for {job_id}: {e}")
             return False
 
-    async def _remove_from_processing_queue(self, job: Job) -> bool:
+    async def _remove_from_processing_queue(self, job: JobModel) -> bool:
         """
         Remove job from processing queue by job ID.
 
@@ -277,7 +277,7 @@ class JobQueue:
             removed_count = 0
             for processing_job in processing_jobs:
                 try:
-                    processing_job_obj = Job.model_validate_json(processing_job)
+                    processing_job_obj = JobModel.model_validate_json(processing_job)
                     if processing_job_obj.id == job_id:
                         # Found job with matching ID, remove it
                         result = await self.redis_client.lrem(
@@ -304,7 +304,7 @@ class JobQueue:
             return False
 
     async def complete_job(
-        self, job: Job, success: bool = True, error_message: Optional[str] = None
+        self, job: JobModel, success: bool = True, error_message: Optional[str] = None
     ) -> bool:
         """
         Mark job as completed or failed.
@@ -365,7 +365,7 @@ class JobQueue:
             logger.error(f"Failed to complete job {job.id}: {e}")
             return False
 
-    async def get_job_status(self, job_id: str) -> Optional[Job]:
+    async def get_job_status(self, job_id: str) -> Optional[JobModel]:
         """
         Get job status by ID.
 
@@ -378,7 +378,7 @@ class JobQueue:
         try:
             job_data = await self.redis_client.hget(get_job_status_key(job_id), "data")
             if job_data:
-                return Job.model_validate_json(job_data)
+                return JobModel.model_validate_json(job_data)
             return None
         except Exception as e:
             logger.error(f"Failed to get job status for {job_id}: {e}")
@@ -477,7 +477,7 @@ class JobQueue:
 
             for raw in items:
                 try:
-                    job = Job.model_validate_json(raw)
+                    job = JobModel.model_validate_json(raw)
                 except Exception as e:
                     logger.warning(f"Ignore job because invalid info, {str(e)}")
                     continue
@@ -514,7 +514,7 @@ class JobQueue:
             # First pass: identify stale jobs
             for processing_job in processing_jobs:
                 try:
-                    job = Job.model_validate_json(processing_job)
+                    job = JobModel.model_validate_json(processing_job)
                     # Check if job has been in processing for too long
                     if job.started_at and job.started_at < threshold:
                         stale_job_ids.append(job.id)

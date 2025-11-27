@@ -17,7 +17,7 @@ def test_handler_registry_register_handlers():
     from tests.examples.handlers import email, sms
 
     registry = HandlerRegistry()
-    registry.register(email.EmailHandler)
+    registry.register(email.EmailJob)
     registry.register(sms.SmsHandler)
 
     assert sorted(registry.snapshot().keys()) == ["email", "sms"]

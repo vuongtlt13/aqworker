@@ -3,8 +3,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Type, Union
 
 from aqworker.constants import get_job_status_key
-from aqworker.handler import BaseHandler
-from aqworker.job.models import Job, JobCreateRequest, JobStatus
+from aqworker.handler.base import BaseHandler
+from aqworker.job.base import CronJob, Job
+from aqworker.job.models import JobCreateRequest, JobModel, JobStatus
 from aqworker.job.queue import JobQueue
 from aqworker.logger import logger
 
@@ -33,7 +34,7 @@ class JobService:
             self._queue = JobQueue(redis_url=self.redis_url)
         return self._queue
 
-    async def _create_job(self, request: JobCreateRequest) -> Job:
+    async def _create_job(self, request: JobCreateRequest) -> JobModel:
         """
         Create a new background job.
 
@@ -45,13 +46,14 @@ class JobService:
         """
         job_id = str(uuid.uuid4())
 
-        job = Job(
+        job = JobModel(
             id=job_id,
             queue_name=request.queue_name,
             handler=request.handler,
             data=request.data,
             metadata=request.metadata,
             scheduled_at=request.scheduled_at,
+            schedule_time=request.schedule_time,
             max_retries=request.max_retries,
             retry_delay=request.retry_delay,
             created_at=datetime.now(timezone.utc),
@@ -67,20 +69,22 @@ class JobService:
 
     async def enqueue_job(
         self,
-        queue_name: str,
-        handler: Union[str, Type[BaseHandler]],
+        handler: Union[str, Type[BaseHandler], Type[Job], Type[CronJob]],
+        queue_name: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         scheduled_at: Optional[datetime] = None,
+        schedule_time: Optional[datetime] = None,
         max_retries: int = 3,
         retry_delay: float = 60,
-    ) -> Job:
+    ) -> JobModel:
         """
         Enqueue a job to be processed by a handler.
 
         Args:
-            queue_name: Queue name to enqueue the job
-            handler: Handler name (string) or handler class (Type[BaseHandler])
+            handler: Handler name (string) or handler class (Type[BaseHandler], Type[Job], or Type[CronJob])
+            queue_name: Queue name to enqueue the job. If None, uses first queue from handler's queue_names.
+                       If provided but not in handler's queue_names, will log a warning.
             data: Job data dictionary to be processed by handler
             metadata: Optional job metadata
             scheduled_at: Optional scheduled execution time
@@ -90,9 +94,21 @@ class JobService:
         Returns:
             Created job
         """
+        handler_cls = None
         if isinstance(handler, str):
             handler_str = handler
-        elif isinstance(handler, type) and issubclass(handler, BaseHandler):
+            # If handler is a string, queue_name must be provided
+            if not queue_name:
+                raise ValueError(
+                    f"queue_name is required when handler is a string. "
+                    f"Either provide queue_name or pass handler as a class with queue_name defined."
+                )
+        elif isinstance(handler, type) and (
+            issubclass(handler, BaseHandler)
+            or issubclass(handler, Job)
+            or issubclass(handler, CronJob)
+        ):
+            handler_cls = handler
             # Use handler's get_name method if available, otherwise class name
             handler_name = getattr(handler, "get_name", None)
             if callable(handler_name):
@@ -101,21 +117,58 @@ class JobService:
                 handler_str = handler.__name__
         else:
             raise ValueError(
-                f"handler must be a string or BaseHandler class, got {type(handler)}"
+                f"handler must be a string or handler class (BaseHandler/Job/CronJob), got {type(handler)}"
             )
 
+        # Determine queue_name: use provided queue_name or get from handler's queue_name
+        final_queue_name = queue_name
+        if handler_cls and not final_queue_name:
+            # Try to get queue_name from handler - it must be defined
+            handler_queue_name = getattr(handler_cls, "queue_name", None)
+            if handler_queue_name:
+                final_queue_name = handler_queue_name
+                logger.debug(
+                    f"Using queue_name '{final_queue_name}' from handler '{handler_str}' queue_name"
+                )
+            else:
+                # Handler class must have queue_name defined
+                raise ValueError(
+                    f"Handler '{handler_str}' (class: {handler_cls.__name__}) must define 'queue_name'. "
+                    f"Either set queue_name as a class attribute or provide queue_name parameter when enqueueing."
+                )
+
+        if not final_queue_name:
+            raise ValueError(
+                f"queue_name is required. Either provide queue_name parameter or "
+                f"define queue_name in handler '{handler_str}'"
+            )
+
+        # If queue_name was provided, check if it matches handler's queue_name (if handler has queue_name)
+        if handler_cls and queue_name:
+            handler_queue_name = getattr(handler_cls, "queue_name", None)
+            if handler_queue_name and queue_name != handler_queue_name:
+                logger.warning(
+                    f"Queue name '{queue_name}' does not match handler '{handler_str}' queue_name "
+                    f"('{handler_queue_name}'). Overriding handler's queue_name."
+                )
+
         request = JobCreateRequest(
-            queue_name=queue_name,
+            queue_name=final_queue_name,
             handler=handler_str,
             data=data or {},
             metadata=metadata or {},
             scheduled_at=scheduled_at,
+            schedule_time=schedule_time,
             max_retries=max_retries,
             retry_delay=retry_delay,
         )
         return await self._create_job(request)
 
-    async def get_job(self, job_id: str) -> Optional[Job]:
+    def get_redis_client(self):
+        """Expose underlying Redis client (primarily for scheduler coordination)."""
+        return self._get_queue().redis_client
+
+    async def get_job(self, job_id: str) -> Optional[JobModel]:
         """
         Get job by ID.
 
@@ -241,7 +294,7 @@ class JobService:
             )
 
             for job_data in completed_jobs:
-                job = Job.model_validate_json(job_data)
+                job = JobModel.model_validate_json(job_data)
                 if job.completed_at and job.completed_at.timestamp() < cutoff_date:
                     await queue.redis_client.lrem(queue.completed_queue, 1, job_data)
                     await queue.redis_client.delete(get_job_status_key(job.id))
@@ -251,7 +304,7 @@ class JobService:
             failed_jobs = await queue.redis_client.lrange(queue.failed_queue, 0, -1)
 
             for job_data in failed_jobs:
-                job = Job.model_validate_json(job_data)
+                job = JobModel.model_validate_json(job_data)
                 if job.completed_at and job.completed_at.timestamp() < cutoff_date:
                     await queue.redis_client.lrem(queue.failed_queue, 1, job_data)
                     await queue.redis_client.delete(get_job_status_key(job.id))
@@ -266,7 +319,7 @@ class JobService:
 
     async def get_next_job(
         self, queue_names: List[str], timeout: int = 0, worker_id: Optional[str] = None
-    ) -> Optional[Job]:
+    ) -> Optional[JobModel]:
         """
         Get next job from specified queues.
 
@@ -290,7 +343,7 @@ class JobService:
             return None
 
     async def complete_job(
-        self, job: Job, success: bool, error_message: Optional[str] = None
+        self, job: JobModel, success: bool, error_message: Optional[str] = None
     ) -> bool:
         """
         Mark a job as completed or failed.

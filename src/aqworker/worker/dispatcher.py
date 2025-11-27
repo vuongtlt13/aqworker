@@ -1,7 +1,7 @@
 import inspect
 
 from aqworker.handler.registry import HandlerRegistry
-from aqworker.job.models import Job
+from aqworker.job.models import JobModel
 from aqworker.logger import logger
 
 
@@ -17,7 +17,7 @@ class HandlerDispatcher:
         """
         self.handler_registry = handler_registry
 
-    async def execute(self, job: Job) -> bool:
+    async def execute(self, job: JobModel) -> bool:
         handler_name = job.handler
         handler_cls = self.handler_registry.get(handler_name)
         if not handler_cls:

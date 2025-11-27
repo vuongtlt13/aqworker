@@ -25,3 +25,14 @@ class NotificationWorker(BaseWorker):
         max_concurrent_jobs=5,
         poll_interval=0.3,
     )
+
+
+class CronWorker(BaseWorker):
+    """Worker for processing cron jobs."""
+
+    worker_name = "cron"
+    worker_config = WorkerConfig(
+        queue_names=["cron"],
+        max_concurrent_jobs=2,
+        poll_interval=1.0,
+    )

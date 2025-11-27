@@ -5,10 +5,11 @@ Core AQWorker class - Main entry point for the aq_worker system.
 import importlib
 import inspect
 import pkgutil
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Type, Union
 
 from aqworker.handler.base import BaseHandler
 from aqworker.handler.registry import HandlerRegistry
+from aqworker.job.base import CronJob, Job
 from aqworker.job.service import JobService
 from aqworker.logger import logger
 from aqworker.worker.dispatcher import HandlerDispatcher
@@ -77,12 +78,14 @@ class AQWorker:
         # Clear cached workers when new aq_worker is registered
         self._workers = {}
 
-    def register_handler(self, handler_class: type["BaseHandler"]) -> None:
+    def register_handler(
+        self, handler_class: Union[Type[BaseHandler], Type[Job], Type[CronJob]]
+    ) -> None:
         """
         Register a handler class.
 
         Args:
-            handler_class: Handler class to register
+            handler_class: Handler class to register (Job, CronJob, or BaseHandler)
         """
         self.handler_registry.register(handler_class)
 
@@ -140,29 +143,35 @@ class AQWorker:
             }
         return list(self._workers.keys())
 
-    def handler(self, name: Optional[str] = None) -> Callable[..., Any]:
+    def job(
+        self, name: Optional[str] = None, queue_name: Optional[str] = None
+    ) -> Callable[..., Any]:
         """
-        Decorator to convert a function into a handler and automatically register it.
+        Decorator to convert a function into a Job handler and automatically register it.
+        Creates a one-time job handler.
 
         Usage:
             aq_worker = AQWorker()
 
-            @aq_worker.handler(name='send_email')
+            @aq_worker.job(name='send_email', queue_name='emails')
             async def send_email(data: dict) -> bool:
                 # Handler logic
                 return True
 
             # Or with default name (function name)
-            @aq_worker.handler()
+            @aq_worker.job(queue_name='emails')
             def process_data(data: dict) -> bool:
                 return True
 
         Args:
             name: Optional handler name. If not provided, uses function name.
+            queue_name: Required queue name for this job handler.
 
         Returns:
             The original function (decorator registers handler automatically)
         """
+        if not queue_name:
+            raise ValueError("queue_name is required for @job decorator")
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             # Determine if function is async
@@ -171,11 +180,15 @@ class AQWorker:
             # Get handler name
             handler_name = name or func.__name__
 
+            # Capture queue_name for use in class definition
+            captured_queue_name = queue_name
+
             # Create handler class dynamically
-            class FunctionHandler(BaseHandler):
-                """Handler class created from function decorator."""
+            class FunctionJob(Job):
+                """Job handler class created from function decorator."""
 
                 name = handler_name
+                queue_name = captured_queue_name
 
                 async def handle(self, data: Dict[str, Any]) -> bool:
                     """Process job data by calling the original function."""
@@ -185,14 +198,90 @@ class AQWorker:
                         return bool(func(data))
 
             # Set class name for better debugging
-            FunctionHandler.__name__ = f"{func.__name__}Handler"
-            FunctionHandler.__qualname__ = f"{func.__qualname__}Handler"
+            FunctionJob.__name__ = f"{func.__name__}Job"
+            FunctionJob.__qualname__ = f"{func.__qualname__}Job"
 
             # Preserve original function for reference
-            FunctionHandler._original_func = func  # type: ignore[attr-defined]
+            FunctionJob._original_func = func  # type: ignore[attr-defined]
 
             # Automatically register handler
-            self.register_handler(FunctionHandler)
+            self.register_handler(FunctionJob)
+
+            # Return original function so it can still be called directly if needed
+            return func
+
+        return decorator
+
+    def cronjob(
+        self, cron: str, name: Optional[str] = None, queue_name: Optional[str] = None
+    ) -> Callable[..., Any]:
+        """
+        Decorator to convert a function into a CronJob handler and automatically register it.
+        Creates a cron job handler that runs on a schedule.
+
+        Usage:
+            aq_worker = AQWorker()
+
+            @aq_worker.cronjob(cron='0 0 * * *', name='daily_report', queue_name='reports')
+            async def daily_report(data: dict) -> bool:
+                # Handler logic
+                return True
+
+            # With default name
+            @aq_worker.cronjob(cron='*/5 * * * *', queue_name='monitoring')
+            def check_status(data: dict) -> bool:
+                return True
+
+        Args:
+            cron: Cron expression (e.g., '0 0 * * *' for daily at midnight)
+            name: Optional handler name. If not provided, uses function name.
+            queue_name: Required queue name for this cron job.
+
+        Returns:
+            The original function (decorator registers handler automatically)
+        """
+        if not queue_name:
+            raise ValueError("queue_name is required for @cronjob decorator")
+
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            # Determine if function is async
+            is_async = inspect.iscoroutinefunction(func)
+
+            # Get handler name
+            handler_name = name or func.__name__
+
+            # Capture variables for use in class definition
+            captured_queue_name = queue_name
+            captured_cron = cron
+
+            # Create handler class dynamically
+            class FunctionCronJob(CronJob):
+                """CronJob handler class created from function decorator."""
+
+                name = handler_name
+                queue_name = captured_queue_name
+
+                @classmethod
+                def cron(cls) -> str:
+                    """Return the cron expression."""
+                    return captured_cron
+
+                async def handle(self, data: Dict[str, Any]) -> bool:
+                    """Process job data by calling the original function."""
+                    if is_async:
+                        return bool(await func(data))
+                    else:
+                        return bool(func(data))
+
+            # Set class name for better debugging
+            FunctionCronJob.__name__ = f"{func.__name__}CronJob"
+            FunctionCronJob.__qualname__ = f"{func.__qualname__}CronJob"
+
+            # Preserve original function for reference
+            FunctionCronJob._original_func = func  # type: ignore[attr-defined]
+
+            # Automatically register handler
+            self.register_handler(FunctionCronJob)
 
             # Return original function so it can still be called directly if needed
             return func
@@ -252,8 +341,12 @@ class AQWorker:
             attribute = getattr(module, attribute_name, None)
             if (
                 inspect.isclass(attribute)
-                and issubclass(attribute, BaseHandler)
-                and attribute is not BaseHandler
+                and (
+                    issubclass(attribute, BaseHandler)
+                    or issubclass(attribute, Job)
+                    or issubclass(attribute, CronJob)
+                )
+                and attribute not in (BaseHandler, Job, CronJob)
             ):
                 try:
                     self.register_handler(attribute)

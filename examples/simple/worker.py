@@ -3,7 +3,7 @@ AQWorker initialization and configuration for the simple job processing example.
 """
 
 from aq_worker.job_service import job_service
-from aq_worker.workers import EmailWorker, NotificationWorker
+from aq_worker.workers import CronWorker, EmailWorker, NotificationWorker
 
 from aqworker import AQWorker
 
@@ -13,6 +13,7 @@ aq_worker = AQWorker(include_packages=["aq_worker"])
 # Register workers
 aq_worker.register_worker(EmailWorker)
 aq_worker.register_worker(NotificationWorker)
+aq_worker.register_worker(CronWorker)
 
 # Listen to job service
 aq_worker.listen(job_service)

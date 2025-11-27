@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from worker import aq_worker
 
-# FastAPI app
+# FastAPI app with lifespan events
 app = FastAPI(
     title="Simple FastAPI with AQWorker",
     description="A simple FastAPI application with background job processing",
@@ -55,8 +55,8 @@ async def enqueue_email_job(request: EmailRequest):
     """
     try:
         job = await aq_worker.job_service.enqueue_job(
-            queue_name="emails",
             handler="email",
+            queue_name="emails",
             data={
                 "recipient": request.recipient,
                 "subject": request.subject,
@@ -86,8 +86,8 @@ async def enqueue_notification_job(request: NotificationRequest):
     """
     try:
         job = await aq_worker.job_service.enqueue_job(
-            queue_name="notifications",
             handler="notification",
+            queue_name="notifications",
             data={
                 "user_id": request.user_id,
                 "message": request.message,

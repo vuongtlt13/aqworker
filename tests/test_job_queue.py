@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from aqworker.constants import get_job_lock_key, get_job_status_key
-from aqworker.job.models import Job, JobStatus
+from aqworker.job.models import JobModel, JobStatus
 from aqworker.job.queue import JobQueue
 
 pytestmark = pytest.mark.asyncio
@@ -17,10 +17,10 @@ def make_job(**overrides):
         "data": {"recipient": "user@example.com"},
     }
     defaults.update(overrides)
-    return Job(**defaults)
+    return JobModel(**defaults)
 
 
-async def _push_job(redis_client, key: str, job: Job):
+async def _push_job(redis_client, key: str, job: JobModel):
     await redis_client.rpush(key, job.model_dump_json())
 
 
@@ -51,7 +51,7 @@ async def test_dequeue_updates_status_and_moves_to_processing(redis_client):
     assert result.status == JobStatus.PROCESSING
     processing_entries = await redis_client.lrange(queue.processing_queue, 0, -1)
     assert len(processing_entries) == 1
-    persisted = Job.model_validate_json(processing_entries[0])
+    persisted = JobModel.model_validate_json(processing_entries[0])
     assert persisted.status == JobStatus.PROCESSING
     status = await redis_client.hgetall(get_job_status_key(job.id))
     assert status["worker_id"] == "worker-1"
@@ -134,7 +134,7 @@ async def test_complete_job_moves_payload(redis_client):
 
     completed = await redis_client.lrange(queue.completed_queue, 0, -1)
     assert len(completed) == 1
-    persisted = Job.model_validate_json(completed[0])
+    persisted = JobModel.model_validate_json(completed[0])
     assert persisted.status == JobStatus.COMPLETED
     assert await redis_client.llen(queue.processing_queue) == 0
 
@@ -149,7 +149,7 @@ async def test_complete_job_handles_failure(redis_client):
     assert await queue.complete_job(job, success=False, error_message="boom") is True
     failed = await redis_client.lrange(queue.failed_queue, 0, -1)
     assert len(failed) == 1
-    persisted = Job.model_validate_json(failed[0])
+    persisted = JobModel.model_validate_json(failed[0])
     assert persisted.status == JobStatus.FAILED
     status = await redis_client.hgetall(get_job_status_key(job.id))
     assert status["error_message"] == "boom"

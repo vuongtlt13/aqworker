@@ -3,10 +3,13 @@ Reusable logic for CLI commands, extracted for easier testing.
 """
 
 import asyncio
+import signal
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from aqworker.core import AQWorker
+from aqworker.job.scheduler import CronScheduler
 from aqworker.job.service import JobService
+from aqworker.logger import logger
 
 if TYPE_CHECKING:
     from aqworker.worker.base import BaseWorker
@@ -65,3 +68,58 @@ def get_queue_stats(
 ) -> Dict[str, int]:
     """Sync wrapper for queue stats."""
     return asyncio.run(get_queue_stats_async(queue_name, job_service))
+
+
+def run_beat(
+    aq_worker: AQWorker,
+    check_interval: Optional[float] = None,
+) -> None:
+    """
+    Run the cron scheduler (beat service).
+
+    Args:
+        aq_worker: AQWorker instance
+        check_interval: Interval in seconds to check for cron jobs (default: 0.1)
+    """
+    from aqworker.constants import DEFAULT_CRON_CHECK_INTERVAL
+
+    if check_interval is None:
+        check_interval = DEFAULT_CRON_CHECK_INTERVAL
+    if not aq_worker.job_service:
+        raise RegistryError(
+            "JobService is required for beat. Make sure AQWorker has a job_service configured."
+        )
+
+    # Create and start cron scheduler
+    scheduler = CronScheduler(
+        handler_registry=aq_worker.handler_registry,
+        job_service=aq_worker.job_service,
+        check_interval=check_interval,
+    )
+
+    # Setup signal handlers for graceful shutdown
+    shutdown_event = asyncio.Event()
+
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down beat...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    async def run():
+        try:
+            await scheduler.start()
+            logger.info(f"Beat scheduler started (check_interval={check_interval}s)")
+            logger.info("Press Ctrl+C to stop")
+
+            # Wait for shutdown signal
+            await shutdown_event.wait()
+
+        except KeyboardInterrupt:
+            logger.info("Beat interrupted by user")
+        finally:
+            await scheduler.stop()
+            logger.info("Beat scheduler stopped")
+
+    asyncio.run(run())
