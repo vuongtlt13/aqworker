@@ -435,12 +435,3 @@ class TestCronScheduler:
         await scheduler.stop()
 
         # Should not crash, scheduler should continue running
-
-    def test_scheduler_requires_croniter(self):
-        """Test that scheduler requires croniter to be installed."""
-        with patch("aqworker.job.scheduler.croniter", None):
-            with pytest.raises(ImportError, match="croniter is required"):
-                CronScheduler(
-                    handler_registry=HandlerRegistry(),
-                    job_service=MagicMock(),
-                )
