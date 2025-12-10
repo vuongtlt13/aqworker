@@ -5,7 +5,7 @@ import pytest
 
 from aqworker.constants import get_job_status_key
 from aqworker.handler import BaseHandler
-from aqworker.job.models import JobCreateRequest, JobModel, JobStatus
+from aqworker.job.models import JobCreateRequest, JobModel, JobStatus, JobStatusInfo
 from aqworker.job.service import JobService
 
 
@@ -67,8 +67,23 @@ class DummyQueue:
         self.enqueued_jobs.append(job.id)
         return True
 
-    async def get_job_status(self, job_id):
+    async def get_job(self, job_id):
         return self.jobs.get(job_id)
+
+    async def get_job_status(self, job_id):
+        job = self.jobs.get(job_id)
+        if not job:
+            return None
+        from aqworker.job.models import JobStatusInfo
+
+        return JobStatusInfo(
+            status=job.status,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            error_message=job.error_message,
+            worker_id=job.worker_id,
+        )
 
     async def get_queue_stats(self, queue_names):
         self.stats_args = queue_names
@@ -147,6 +162,30 @@ async def test_get_job_and_stats_use_queue(job_service):
 
 
 @pytest.mark.asyncio
+async def test_get_job_status_returns_lightweight_info(job_service):
+    """Test that get_job_status returns status info without full job data."""
+    service, queue = job_service
+    job = await service.enqueue_job("tasks", "handler")
+
+    status_info = await service.get_job_status(job.id)
+    assert status_info is not None
+    assert isinstance(status_info, JobStatusInfo)
+    assert status_info.status == JobStatus.PENDING
+    assert status_info.created_at is not None
+    assert status_info.completed_at is None
+    assert status_info.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_get_job_status_returns_none_for_missing_job(job_service):
+    """Test get_job_status returns None for non-existent job."""
+    service, queue = job_service
+
+    status_info = await service.get_job_status("non-existent-job-id")
+    assert status_info is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_job_updates_pending_status(job_service):
     service, queue = job_service
     job = await service.enqueue_job("tasks", "handler")
@@ -154,6 +193,10 @@ async def test_cancel_job_updates_pending_status(job_service):
 
     key = get_job_status_key(job.id)
     assert queue.redis_client.hash_sets[key]["status"] == JobStatus.CANCELLED.value
+    # Verify data field is updated with new status
+    data_job = JobModel.model_validate_json(queue.redis_client.hash_sets[key]["data"])
+    assert data_job.status == JobStatus.CANCELLED
+    assert data_job.completed_at is not None
 
 
 @pytest.mark.asyncio

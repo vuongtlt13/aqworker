@@ -12,7 +12,7 @@ from aqworker.constants import (
     get_job_status_key,
     get_queue_name,
 )
-from aqworker.job.models import JobModel, JobStatus
+from aqworker.job.models import JobModel, JobStatus, JobStatusInfo
 from aqworker.logger import logger
 
 
@@ -143,6 +143,7 @@ class JobQueue:
                             "status": job.status.value,
                             "started_at": job.started_at.isoformat(),
                             "worker_id": worker_id or "unknown",
+                            "data": job.model_dump_json(),  # Update data field to keep it in sync
                         },
                     )
 
@@ -332,13 +333,14 @@ class JobQueue:
                 # Move to failed queue
                 await self.redis_client.lpush(self.failed_queue, job.model_dump_json())
 
-            # Update job status
+            # Update job status and data field
             await self.redis_client.hset(
                 get_job_status_key(job.id),
                 mapping={
                     "status": job.status.value,
                     "completed_at": job.completed_at.isoformat(),
                     "error_message": error_message or "",
+                    "data": job.model_dump_json(),  # Update data field to keep it in sync
                 },
             )
 
@@ -365,9 +367,9 @@ class JobQueue:
             logger.error(f"Failed to complete job {job.id}: {e}")
             return False
 
-    async def get_job_status(self, job_id: str) -> Optional[JobModel]:
+    async def get_job(self, job_id: str) -> Optional[JobModel]:
         """
-        Get job status by ID.
+        Get job by ID.
 
         Args:
             job_id: Job identifier
@@ -380,6 +382,61 @@ class JobQueue:
             if job_data:
                 return JobModel.model_validate_json(job_data)
             return None
+        except Exception as e:
+            logger.error(f"Failed to get job for {job_id}: {e}")
+            return None
+
+    async def get_job_status(self, job_id: str) -> Optional[JobStatusInfo]:
+        """
+        Get job status information by ID (lightweight, without parsing full job data).
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            JobStatusInfo or None if not found
+        """
+        try:
+            # Get all hash fields except 'data' to avoid parsing JSON
+            status_data = await self.redis_client.hgetall(get_job_status_key(job_id))
+            if not status_data:
+                return None
+
+            # Parse status fields directly from hash (no JSON parsing needed)
+            status_value = status_data.get("status")
+            if not status_value:
+                return None
+
+            # Parse datetime fields
+            created_at = None
+            if "created_at" in status_data:
+                try:
+                    created_at = datetime.fromisoformat(status_data["created_at"])
+                except (ValueError, TypeError):
+                    pass
+
+            started_at = None
+            if "started_at" in status_data:
+                try:
+                    started_at = datetime.fromisoformat(status_data["started_at"])
+                except (ValueError, TypeError):
+                    pass
+
+            completed_at = None
+            if "completed_at" in status_data:
+                try:
+                    completed_at = datetime.fromisoformat(status_data["completed_at"])
+                except (ValueError, TypeError):
+                    pass
+
+            return JobStatusInfo(
+                status=JobStatus(status_value),
+                created_at=created_at,
+                started_at=started_at,
+                completed_at=completed_at,
+                error_message=status_data.get("error_message") or None,
+                worker_id=status_data.get("worker_id") or None,
+            )
         except Exception as e:
             logger.error(f"Failed to get job status for {job_id}: {e}")
             return None

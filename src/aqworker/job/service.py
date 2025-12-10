@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 from aqworker.constants import get_job_status_key
 from aqworker.handler.base import BaseHandler
 from aqworker.job.base import CronJob, Job
-from aqworker.job.models import JobCreateRequest, JobModel, JobStatus
+from aqworker.job.models import JobCreateRequest, JobModel, JobStatus, JobStatusInfo
 from aqworker.job.queue import JobQueue
 from aqworker.logger import logger
 
@@ -180,9 +180,26 @@ class JobService:
         """
         try:
             queue = self._get_queue()  # Service queue for general operations
-            return await queue.get_job_status(job_id)
+            return await queue.get_job(job_id)
         except Exception as e:
             logger.error(f"Error getting job {job_id}: {e}")
+            return None
+
+    async def get_job_status(self, job_id: str) -> Optional[JobStatusInfo]:
+        """
+        Get job status information by ID (lightweight, without parsing full job data).
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            JobStatusInfo or None if not found
+        """
+        try:
+            queue = self._get_queue()  # Service queue for general operations
+            return await queue.get_job_status(job_id)
+        except Exception as e:
+            logger.error(f"Error getting job status for {job_id}: {e}")
             return None
 
     async def get_queue_stats(
@@ -229,6 +246,7 @@ class JobService:
             mapping={
                 "status": job.status.value,
                 "completed_at": job.completed_at.isoformat(),
+                "data": job.model_dump_json(),  # Update data field to keep it in sync
             },
         )
 

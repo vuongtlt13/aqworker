@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from aqworker.constants import get_job_lock_key, get_job_status_key
-from aqworker.job.models import JobModel, JobStatus
+from aqworker.job.models import JobModel, JobStatus, JobStatusInfo
 from aqworker.job.queue import JobQueue
 
 pytestmark = pytest.mark.asyncio
@@ -153,9 +153,14 @@ async def test_complete_job_handles_failure(redis_client):
     assert persisted.status == JobStatus.FAILED
     status = await redis_client.hgetall(get_job_status_key(job.id))
     assert status["error_message"] == "boom"
+    # Verify data field is updated with new status
+    data_job = JobModel.model_validate_json(status["data"])
+    assert data_job.status == JobStatus.FAILED
+    assert data_job.error_message == "boom"
+    assert data_job.completed_at is not None
 
 
-async def test_get_job_status_returns_job(redis_client):
+async def test_get_job_returns_job(redis_client):
     queue = JobQueue("redis://localhost:6379/0")
     queue.redis_client = redis_client
     job = make_job()
@@ -163,8 +168,95 @@ async def test_get_job_status_returns_job(redis_client):
         get_job_status_key(job.id), mapping={"data": job.model_dump_json()}
     )
 
-    result = await queue.get_job_status(job.id)
+    result = await queue.get_job(job.id)
     assert result.id == job.id
+
+
+async def test_get_job_status_returns_lightweight_info(redis_client):
+    """Test that get_job_status returns status info without parsing full job data."""
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    job = make_job()
+
+    # Set status fields directly in hash (simulating what happens during job lifecycle)
+    await redis_client.hset(
+        get_job_status_key(job.id),
+        mapping={
+            "status": JobStatus.PROCESSING.value,
+            "created_at": job.created_at.isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "worker_id": "worker-123",
+            "data": job.model_dump_json(),  # This field exists but won't be parsed
+        },
+    )
+
+    result = await queue.get_job_status(job.id)
+    assert result is not None
+    assert isinstance(result, JobStatusInfo)
+    assert result.status == JobStatus.PROCESSING
+    assert result.created_at is not None
+    assert result.started_at is not None
+    assert result.worker_id == "worker-123"
+    assert result.completed_at is None
+    assert result.error_message is None
+
+
+async def test_get_job_status_handles_completed_job(redis_client):
+    """Test get_job_status for completed job."""
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    job = make_job()
+    completed_at = datetime.now(timezone.utc)
+
+    await redis_client.hset(
+        get_job_status_key(job.id),
+        mapping={
+            "status": JobStatus.COMPLETED.value,
+            "created_at": job.created_at.isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "data": job.model_dump_json(),
+        },
+    )
+
+    result = await queue.get_job_status(job.id)
+    assert result is not None
+    assert result.status == JobStatus.COMPLETED
+    assert result.completed_at is not None
+    assert result.completed_at.isoformat() == completed_at.isoformat()
+
+
+async def test_get_job_status_handles_failed_job(redis_client):
+    """Test get_job_status for failed job with error message."""
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    job = make_job()
+    completed_at = datetime.now(timezone.utc)
+
+    await redis_client.hset(
+        get_job_status_key(job.id),
+        mapping={
+            "status": JobStatus.FAILED.value,
+            "created_at": job.created_at.isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "error_message": "Test error",
+            "data": job.model_dump_json(),
+        },
+    )
+
+    result = await queue.get_job_status(job.id)
+    assert result is not None
+    assert result.status == JobStatus.FAILED
+    assert result.error_message == "Test error"
+    assert result.completed_at is not None
+
+
+async def test_get_job_status_returns_none_for_missing_job(redis_client):
+    """Test get_job_status returns None for non-existent job."""
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+
+    result = await queue.get_job_status("non-existent-job-id")
+    assert result is None
 
 
 async def test_cleanup_old_entries_removes_stale_entries(redis_client):

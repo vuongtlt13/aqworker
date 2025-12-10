@@ -98,9 +98,12 @@ class JobUpdateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
-class JobResponse(BaseModel):
-    """Response model for job operations."""
+class JobStatusInfo(BaseModel):
+    """Lightweight job status information (without full job data)."""
 
-    success: bool
-    message: str
-    data: Optional[JobModel] = None
+    status: JobStatus
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    worker_id: Optional[str] = None
