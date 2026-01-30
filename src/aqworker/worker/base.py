@@ -6,6 +6,7 @@ import socket
 import time
 from abc import ABC
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from aqworker.job.models import JobModel
@@ -145,6 +146,29 @@ class BaseWorker(ABC):
         )
 
         try:
+            # Skip expired cron jobs (too far in the past) without executing handler
+            try:
+                if job.metadata.get("cron_job") and job.schedule_time:
+                    now = datetime.now(timezone.utc)
+                    delay = (now - job.schedule_time).total_seconds()
+                    # Reuse job_timeout as the maximum acceptable delay window
+                    if delay > float(self.job_timeout):
+                        logger.warning(
+                            f"Skipping expired cron job {job_id}: "
+                            f"schedule_time={job.schedule_time.isoformat()}, "
+                            f"delay={delay:.2f}s > max_delay={self.job_timeout}s"
+                        )
+                        await self.job_service.complete_job(
+                            job=job, success=True, error_message=None
+                        )
+                        return
+            except (
+                Exception
+            ) as e:  # Best-effort guard; never fail job because of this check
+                logger.warning(
+                    f"Failed to evaluate expiration for cron job {job_id}: {e}"
+                )
+
             logger.info(
                 f"Worker {self.worker_id} processing job {job_id} from queue {job.queue_name}"
             )

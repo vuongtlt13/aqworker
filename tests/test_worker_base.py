@@ -1,5 +1,6 @@
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -156,6 +157,97 @@ async def test_health_check_and_log_stats(monkeypatch):
     # Exercise periodic stats logger
     await worker._log_periodic_stats()
     assert service.stats_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_cron_job_is_skipped_without_executing_handler():
+    """Cron jobs with schedule_time too far in the past should be skipped."""
+    dispatcher = StubDispatcher(result=True)
+    service = StubJobService()
+
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    # Make the allowed delay small so our test schedule_time is clearly expired
+    worker.job_timeout = 30  # seconds
+
+    job = make_job(id="cron-job-1")
+    job.metadata["cron_job"] = True
+    job.schedule_time = datetime.now(timezone.utc) - timedelta(seconds=120)
+
+    # Track handler executions explicitly
+    executed_jobs = []
+
+    async def fake_execute(j):
+        executed_jobs.append(j.id)
+        return True
+
+    dispatcher.execute = fake_execute  # type: ignore[assignment]
+
+    await worker._process_job_async(job)
+
+    # Handler should never be called for expired cron job
+    assert executed_jobs == []
+    # Job should be marked as completed by job_service without retry
+    assert service.completed == [(job.id, True, None)]
+    assert service.retried == []
+
+
+@pytest.mark.asyncio
+async def test_recent_cron_job_is_processed_normally():
+    """Cron jobs within allowed delay window should still be executed."""
+    dispatcher = StubDispatcher(result=True)
+    service = StubJobService()
+
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.job_timeout = 300  # 5 minutes
+
+    job = make_job(id="cron-job-2")
+    job.metadata["cron_job"] = True
+    # schedule_time 10 seconds ago -> within job_timeout window
+    job.schedule_time = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+    executed_jobs = []
+
+    async def fake_execute(j):
+        executed_jobs.append(j.id)
+        return True
+
+    dispatcher.execute = fake_execute  # type: ignore[assignment]
+
+    await worker._process_job_async(job)
+
+    # Handler should be called for non-expired cron job
+    assert executed_jobs == ["cron-job-2"]
+    # Job should be marked as completed via job_service
+    assert service.completed == [(job.id, True, None)]
+
+
+@pytest.mark.asyncio
+async def test_non_cron_job_is_not_affected_by_expiration_logic():
+    """Non-cron jobs should never be skipped based on schedule_time."""
+    dispatcher = StubDispatcher(result=True)
+    service = StubJobService()
+
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.job_timeout = 30  # keep same as expiration test
+
+    job = make_job(id="regular-job-1")
+    # Intentionally set an old schedule_time but without cron_job metadata flag
+    job.schedule_time = datetime.now(timezone.utc) - timedelta(seconds=120)
+
+    executed_jobs = []
+
+    async def fake_execute(j):
+        executed_jobs.append(j.id)
+        return True
+
+    dispatcher.execute = fake_execute  # type: ignore[assignment]
+
+    await worker._process_job_async(job)
+
+    # Handler should still be called for non-cron jobs
+    assert executed_jobs == ["regular-job-1"]
+    # Job should be marked as completed normally
+    assert service.completed == [(job.id, True, None)]
 
 
 @pytest.mark.asyncio
