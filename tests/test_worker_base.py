@@ -158,6 +158,73 @@ async def test_health_check_and_log_stats(monkeypatch):
     assert service.stats_calls == 2
 
 
+@pytest.mark.asyncio
+async def test_run_processes_jobs_concurrently(monkeypatch):
+    """Worker.run should start multiple jobs concurrently up to max_concurrent_jobs."""
+    dispatcher = StubDispatcher(result=True)
+    service = StubJobService()
+
+    # Two distinct jobs for the same queue
+    job1 = make_job(id="job-1")
+    job2 = make_job(id="job-2")
+
+    async def fake_get_next_job(queue_names, timeout=0, worker_id=None):
+        # First call -> job1, second call -> job2, then no more jobs
+        call_count = getattr(fake_get_next_job, "call_count", 0)
+        call_count += 1
+        fake_get_next_job.call_count = call_count
+
+        if call_count == 1:
+            return job1
+        if call_count == 2:
+            return job2
+        # After both jobs have been dispatched, no new jobs
+        await asyncio.sleep(0)
+        return None
+
+    # Monkeypatch service.get_next_job used by BaseWorker.run
+    service.get_next_job = fake_get_next_job  # type: ignore[assignment]
+
+    # Events to coordinate execution and to detect true concurrency
+    job1_started = asyncio.Event()
+    job2_started = asyncio.Event()
+    job1_may_finish = asyncio.Event()
+
+    async def concurrent_execute(job):
+        # Mark when each job starts
+        if job.id == "job-1":
+            job1_started.set()
+            # Block job-1 until we explicitly allow it to finish
+            await job1_may_finish.wait()
+        elif job.id == "job-2":
+            job2_started.set()
+        return True
+
+    dispatcher.execute = concurrent_execute  # type: ignore[assignment]
+
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.max_concurrent_jobs = 2
+    worker.poll_interval = 0.01
+
+    async def orchestrate_shutdown():
+        # Wait until both jobs have actually started executing
+        await asyncio.wait_for(job1_started.wait(), timeout=0.5)
+        await asyncio.wait_for(job2_started.wait(), timeout=0.5)
+
+        # At this point, job2 has started while job1 is still blocked -> true concurrency
+        worker.shutdown_requested = True
+        # Allow job1 to complete so run() can exit cleanly
+        job1_may_finish.set()
+
+    run_task = asyncio.create_task(worker.run())
+    orchestrator = asyncio.create_task(orchestrate_shutdown())
+
+    await asyncio.gather(run_task, orchestrator)
+
+    # Both jobs should have been processed
+    assert {j[0] for j in service.completed} == {"job-1", "job-2"}
+
+
 def test_shutdown_waits_for_running_jobs(monkeypatch):
     worker = BaseWorker(
         handler_dispatcher=StubDispatcher(), job_service=StubJobService()

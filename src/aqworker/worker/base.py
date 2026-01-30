@@ -102,6 +102,8 @@ class BaseWorker(ABC):
 
         # Track running jobs
         self.running_jobs: Set[str] = set()
+        # Track asyncio Tasks for concurrent job execution
+        self._tasks: Set[asyncio.Task[Any]] = set()
         self.shutdown_requested = False
 
         # Setup signal handlers
@@ -131,8 +133,7 @@ class BaseWorker(ABC):
     def _can_process_job(self) -> bool:
         """Check if aq_worker can process more jobs."""
         return (
-            len(self.running_jobs) < self.max_concurrent_jobs
-            and not self.shutdown_requested
+            len(self._tasks) < self.max_concurrent_jobs and not self.shutdown_requested
         )
 
     async def _process_job_async(self, job: JobModel):
@@ -330,7 +331,15 @@ class BaseWorker(ABC):
                     )  # Non-blocking
 
                     if job:
-                        await self._process_job_async(job)
+                        # Run job processing concurrently up to max_concurrent_jobs
+                        task = asyncio.create_task(self._process_job_async(job))
+                        self._tasks.add(task)
+
+                        def _on_task_done(t: asyncio.Task[Any]) -> None:
+                            # Remove finished task from tracking set
+                            self._tasks.discard(t)
+
+                        task.add_done_callback(_on_task_done)
                     else:
                         # No jobs available, wait a bit
                         await asyncio.sleep(self.poll_interval)
