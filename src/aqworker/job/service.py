@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Type, Union
 
-from aqworker.constants import get_job_status_key
+from aqworker.constants import STALE_JOB_MIN_AGE, get_job_status_key
 from aqworker.handler.base import BaseHandler
 from aqworker.job.base import CronJob, Job
 from aqworker.job.models import JobCreateRequest, JobModel, JobStatus, JobStatusInfo
@@ -56,6 +56,7 @@ class JobService:
             schedule_time=request.schedule_time,
             max_retries=request.max_retries,
             retry_delay=request.retry_delay,
+            timeout=request.timeout,
             created_at=datetime.now(timezone.utc),
         )
 
@@ -77,6 +78,7 @@ class JobService:
         schedule_time: Optional[datetime] = None,
         max_retries: int = 3,
         retry_delay: float = 60,
+        timeout: Optional[float] = None,
     ) -> JobModel:
         """
         Enqueue a job to be processed by a handler.
@@ -90,6 +92,8 @@ class JobService:
             scheduled_at: Optional scheduled execution time
             max_retries: Maximum retry attempts
             retry_delay: Retry delay in seconds
+            timeout: Max execution time in seconds. None uses the handler class's
+                `timeout`, then the worker's job_timeout; 0 disables the limit.
 
         Returns:
             Created job
@@ -152,6 +156,9 @@ class JobService:
                     f"('{handler_queue_name}'). Overriding handler's queue_name."
                 )
 
+        if timeout is None and handler_cls:
+            timeout = getattr(handler_cls, "timeout", None)
+
         request = JobCreateRequest(
             queue_name=final_queue_name,
             handler=handler_str,
@@ -161,6 +168,7 @@ class JobService:
             schedule_time=schedule_time,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            timeout=timeout,
         )
         return await self._create_job(request)
 
@@ -253,12 +261,14 @@ class JobService:
         logger.info(f"Cancelled job {job_id}")
         return True
 
-    async def retry_job(self, job_id: str) -> bool:
+    async def retry_job(self, job_id: str, delay: float = 0) -> bool:
         """
         Retry a failed job.
 
         Args:
             job_id: Job identifier
+            delay: Seconds to wait before the job becomes pending again. The job is
+                parked in Redis meanwhile, so no worker slot is held.
 
         Returns:
             True if successful, False otherwise
@@ -283,13 +293,34 @@ class JobService:
         job.started_at = None
         job.completed_at = None
 
-        # Re-enqueue to same queue
+        # Re-enqueue to same queue, through the delayed set when a delay is requested
         queue = self._get_queue()
-        if await queue.enqueue(job):
-            logger.info(f"Retrying job {job_id} (attempt {job.retry_count})")
-            return True
+        if delay > 0:
+            run_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            ok = await queue.schedule(job, run_at)
         else:
-            return False
+            ok = await queue.enqueue(job)
+        if ok:
+            logger.info(
+                f"Retrying job {job_id} (attempt {job.retry_count}) in {delay:g}s"
+            )
+        return ok
+
+    async def promote_due_jobs(self, queue_names: List[str]) -> int:
+        """
+        Move delayed jobs (e.g. delayed retries) whose time has come into their queues.
+
+        Args:
+            queue_names: Queues to promote delayed jobs for
+
+        Returns:
+            Number of jobs moved
+        """
+        try:
+            return await self._get_queue().promote_due_jobs(queue_names)
+        except Exception as e:
+            logger.error(f"Failed to promote delayed jobs: {e}")
+            return 0
 
     async def cleanup_old_jobs(self, days: int = 7) -> int:
         """
@@ -336,7 +367,11 @@ class JobService:
             return 0
 
     async def get_next_job(
-        self, queue_names: List[str], timeout: int = 0, worker_id: Optional[str] = None
+        self,
+        queue_names: List[str],
+        timeout: int = 0,
+        worker_id: Optional[str] = None,
+        default_job_timeout: Optional[float] = None,
     ) -> Optional[JobModel]:
         """
         Get next job from specified queues.
@@ -345,6 +380,7 @@ class JobService:
             queue_names: List of queue names to check
             timeout: Blocking timeout in seconds (0 = no blocking)
             worker_id: Worker identifier for job locking
+            default_job_timeout: Execution timeout for jobs that don't set one
 
         Returns:
             Job or None if no jobs available
@@ -353,7 +389,10 @@ class JobService:
             # Use a generic queue for dequeue operations
             queue = self._get_queue()
             return await queue.dequeue(
-                queue_names=queue_names, timeout=timeout, worker_id=worker_id
+                queue_names=queue_names,
+                timeout=timeout,
+                worker_id=worker_id,
+                default_job_timeout=default_job_timeout,
             )
 
         except Exception as e:
@@ -385,12 +424,14 @@ class JobService:
             logger.error(f"Failed to complete job {job.id}: {e}")
             return False
 
-    async def cleanup_stale_processing_jobs(self, max_age_seconds: int = 300) -> int:
+    async def cleanup_stale_processing_jobs(
+        self, max_age_seconds: int = STALE_JOB_MIN_AGE
+    ) -> int:
         """
-        Clean up stale jobs from processing queue.
+        Drop stale jobs from the processing queue (marked FAILED, never retried).
 
         Args:
-            max_age_seconds: Maximum age for processing jobs (default 5 minutes)
+            max_age_seconds: Minimum processing age before a job is stale
 
         Returns:
             Number of stale jobs removed

@@ -7,6 +7,8 @@ class BaseHandler(ABC):
 
     name: Optional[str] = None
     queue_name: Optional[str] = None
+    # Max execution time in seconds; None falls back to the worker's job_timeout
+    timeout: Optional[float] = None
 
     @classmethod
     def cron(cls) -> Optional[str]:

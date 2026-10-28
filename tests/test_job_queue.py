@@ -326,6 +326,80 @@ async def test_cleanup_stale_processing_jobs_removes_expired(redis_client):
     assert removed == 1
     assert await redis_client.llen(queue.processing_queue) == 0
 
+    # Dropped without retry: recorded as failed so the app can see and handle it
+    [failed_raw] = await redis_client.lrange(queue.failed_queue, 0, -1)
+    failed = JobModel.model_validate_json(failed_raw)
+    assert failed.id == "old-job"
+    assert failed.status == JobStatus.FAILED
+    assert failed.error_message.startswith("Stale")
+    assert failed.retry_count == 0
+    status = await redis_client.hgetall(get_job_status_key("old-job"))
+    assert status["status"] == JobStatus.FAILED.value
+    assert await redis_client.llen(queue._get_queue_name("emails")) == 0
+
+
+async def test_cleanup_stale_respects_job_timeout(redis_client):
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    started = datetime.now(timezone.utc) - timedelta(seconds=400)
+
+    long_job = make_job(id="long", timeout=1800, started_at=started)
+    unlimited = make_job(id="unlimited", timeout=0, started_at=started)
+    short_job = make_job(id="short", timeout=30, started_at=started)
+    for job in (long_job, unlimited, short_job):
+        await redis_client.lpush(queue.processing_queue, job.model_dump_json())
+
+    assert await queue.cleanup_stale_processing_jobs(300) == 1
+    remaining = {
+        JobModel.model_validate_json(raw).id
+        for raw in await redis_client.lrange(queue.processing_queue, 0, -1)
+    }
+    assert remaining == {"long", "unlimited"}
+
+
+async def test_get_queue_stats_does_not_drop_processing_jobs(redis_client):
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+
+    old = make_job(id="old", started_at=datetime.now(timezone.utc) - timedelta(hours=1))
+    await redis_client.lpush(queue.processing_queue, old.model_dump_json())
+
+    stats = await queue.get_queue_stats(["emails"])
+    assert stats["processing"] == 1
+
+
+async def test_schedule_and_promote_due_jobs(redis_client):
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    now = datetime.now(timezone.utc)
+
+    due = make_job(id="due")
+    later = make_job(id="later")
+    assert await queue.schedule(due, now - timedelta(seconds=1)) is True
+    assert await queue.schedule(later, now + timedelta(seconds=60)) is True
+
+    stats = await queue.get_queue_stats(["emails"])
+    assert stats["delayed"] == 2
+    assert stats["pending"] == 0
+
+    assert await queue.promote_due_jobs(["emails"]) == 1
+    job = await queue.dequeue(["emails"], timeout=0, worker_id="w1")
+    assert job.id == "due"
+    assert await queue.dequeue(["emails"], timeout=0, worker_id="w1") is None
+    assert (await queue.get_queue_stats(["emails"]))["delayed"] == 1
+
+
+async def test_dequeue_stamps_default_timeout(redis_client):
+    queue = JobQueue("redis://localhost:6379/0")
+    queue.redis_client = redis_client
+    await queue.enqueue(make_job(id="a"))
+    await queue.enqueue(make_job(id="b", timeout=5))
+
+    a = await queue.dequeue(["emails"], worker_id="w1", default_job_timeout=30)
+    b = await queue.dequeue(["emails"], worker_id="w1", default_job_timeout=30)
+    assert (a.id, a.timeout) == ("a", 30)
+    assert (b.id, b.timeout) == ("b", 5)
+
 
 async def test_clear_queue_variants(redis_client):
     queue = JobQueue("redis://localhost:6379/0")

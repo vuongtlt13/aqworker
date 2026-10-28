@@ -57,6 +57,12 @@ class JobModel(BaseModel):
     retry_count: int = Field(default=0, description="Current retry count")
     retry_delay: float = Field(default=60, description="Retry delay in seconds")
 
+    # Execution limit
+    timeout: Optional[float] = Field(
+        default=None,
+        description="Max execution time in seconds; None uses handler/worker default, 0 disables",
+    )
+
     # Error handling
     error_message: Optional[str] = Field(
         default=None, description="Error message if failed"
@@ -87,6 +93,7 @@ class JobCreateRequest(BaseModel):
     schedule_time: Optional[datetime] = None
     max_retries: int = 3
     retry_delay: float = 60
+    timeout: Optional[float] = None
 
 
 class JobUpdateRequest(BaseModel):

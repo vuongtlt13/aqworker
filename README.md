@@ -503,9 +503,49 @@ class MyWorker(BaseWorker):
         queue_names=["my_queue"],
         max_concurrent_jobs=5,      # Max jobs processed simultaneously
         poll_interval=0.5,          # Seconds between queue polls
-        job_timeout=300,            # Job timeout in seconds
+        job_timeout=300,            # Default max execution time per job (0 = unlimited)
+        shutdown_timeout=30,        # Grace period for running jobs on SIGTERM/SIGINT
     )
 ```
+
+### Timeouts, retries and shutdown
+
+**Per-job timeout.** The execution limit is resolved in this order (first non-`None` wins,
+`0` = unlimited):
+
+1. `enqueue_job(..., timeout=...)`
+2. the handler class attribute `timeout`
+3. the worker's `job_timeout`
+
+```python
+class ReportJob(Job):
+    name = "report"
+    queue_name = "reports"
+    timeout = 600  # this handler may run up to 10 minutes
+
+await aq_worker.job_service.enqueue_job(ReportJob, data={...}, timeout=0)  # no limit
+```
+
+A timed-out job is cancelled and counted as a failed attempt (retried within
+`max_retries`). The limit can only interrupt `async` handlers — a sync handler blocks the
+event loop and cannot be cancelled, so keep long work async.
+
+**Retry delay.** `retry_delay` no longer holds a worker slot: the retry is parked in the
+Redis sorted set `aqw:delayed:{queue_name}` and moved back to the queue when due (checked
+every second by workers listening on that queue). Delayed retries survive worker restarts.
+
+**Graceful shutdown.** On SIGTERM/SIGINT the worker stops taking new jobs and waits up to
+`shutdown_timeout` seconds for running jobs. Jobs still running after that are cancelled
+and recorded as failed with `"Job cancelled by worker shutdown"`, then retried within their
+budget. Set the container stop grace period (e.g. Docker `stop_grace_period`) above
+`shutdown_timeout`.
+
+**Stuck jobs are dropped, not retried.** If a worker dies mid-job (OOM kill, `SIGKILL`), the
+job stays in `aqw:processing`. Workers periodically mark such jobs `FAILED` (error message
+starting with `"Stale:"`) and move them to `aqw:failed` **without retrying**. A job counts
+as stuck once it has been processing longer than `max(300s, timeout + 60s)`; jobs with
+`timeout=0` are never treated as stuck. The application must detect and handle these
+itself (e.g. make handlers idempotent and re-enqueue, or reconcile from its own data).
 
 ## Job Lifecycle
 
@@ -513,9 +553,10 @@ class MyWorker(BaseWorker):
 1. ENQUEUE: Job created via JobService.enqueue_job()
 2. QUEUE: Job added to Redis queue (aqw:{queue_name})
 3. DEQUEUE: Worker gets job via JobService.get_next_job()
-4. PROCESS: Job moved to processing queue, handler executed
+4. PROCESS: Job moved to processing queue, handler executed (within its timeout)
 5. COMPLETE: Job marked as completed/failed
-6. CLEANUP: Old jobs cleaned up automatically
+   └── failed + retries left → aqw:delayed:{queue_name} → back to QUEUE after retry_delay
+6. CLEANUP: Old jobs cleaned up; stuck processing jobs marked failed (no retry)
 ```
 
 ## Queue System
@@ -526,6 +567,7 @@ AQWorker keeps every Redis key namespaced with the `aqw` prefix so multiple apps
 share the same Redis without collisions. The most important keys are:
 
 - `aqw:{queue_name}` – pending FIFO queue for a specific worker queue
+- `aqw:delayed:{queue_name}` – sorted set of retries waiting out `retry_delay`
 - `aqw:processing`, `aqw:completed`, `aqw:failed` – global processing/completed/failed lists
 - `aqw:job:{job_id}` – job status hash (timestamps, error state, etc.)
 - `aqw:jl:{job_id}` – per-job lock key used to ensure only one worker processes the job
@@ -540,6 +582,7 @@ manually.
 Redis Keys:
 ├── aqw:emails        # Email jobs (FIFO)
 ├── aqw:notifications # Notification jobs (FIFO)
+├── aqw:delayed:emails # Retries waiting for retry_delay (sorted set)
 ├── aqw:processing    # Jobs currently being processed
 ├── aqw:completed     # Successfully completed jobs
 └── aqw:failed        # Failed jobs

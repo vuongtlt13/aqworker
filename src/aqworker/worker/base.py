@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
+from aqworker.constants import DEFAULT_SHUTDOWN_TIMEOUT, DELAYED_PROMOTE_INTERVAL
 from aqworker.job.models import JobModel
 from aqworker.job.service import JobService
 from aqworker.logger import logger
@@ -31,7 +32,10 @@ class WorkerConfig:
     max_concurrent_jobs: int = 5
     poll_interval: float = 0.3  # 300ms
     queue_names: List[str] = field(default_factory=list)
+    # Default max execution time per job (seconds, 0 = unlimited); jobs/handlers can override
     job_timeout: int = 30
+    # Seconds to let running jobs finish after SIGTERM/SIGINT before cancelling them
+    shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT
 
     def as_dict(self) -> Dict[str, Any]:
         """Return config as plain dict for serialization/inspection."""
@@ -97,6 +101,7 @@ class BaseWorker(ABC):
         self.poll_interval = config.get("poll_interval", 1)
         self.max_concurrent_jobs = config.get("max_concurrent_jobs", 5)
         self.job_timeout = config.get("job_timeout", 300)
+        self.shutdown_timeout = config.get("shutdown_timeout", DEFAULT_SHUTDOWN_TIMEOUT)
 
         # Queue settings
         self.queue_names = config.get("queue_names", [])
@@ -130,6 +135,11 @@ class BaseWorker(ABC):
             f"Worker {self.worker_id} received signal {signum}, initiating graceful shutdown..."
         )
         self.shutdown_requested = True
+
+    def _effective_timeout(self, job: JobModel) -> Optional[float]:
+        """Execution limit for a job: its own timeout, else the worker default; None = unlimited."""
+        timeout = job.timeout if job.timeout is not None else self.job_timeout
+        return float(timeout) if timeout and timeout > 0 else None
 
     def _can_process_job(self) -> bool:
         """Check if aq_worker can process more jobs."""
@@ -178,8 +188,19 @@ class BaseWorker(ABC):
                     "HandlerDispatcher not provided! Pass handler_dispatcher to aq_worker constructor."
                 )
 
-            # Process the job using aq_worker-specific logic
-            success = await self.handler_dispatcher.execute(job)
+            # Process the job using aq_worker-specific logic. The limit only interrupts
+            # async handlers: a sync handler blocks the event loop and cannot be cancelled.
+            timeout = self._effective_timeout(job)
+            try:
+                success = await asyncio.wait_for(
+                    self.handler_dispatcher.execute(job), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Job {job_id} ({job.handler}) timed out after {timeout}s")
+                await self._retry_or_fail(
+                    job, error_message=f"Job timed out after {timeout:g}s"
+                )
+                return
 
             if success:
                 # Mark job as completed via job service
@@ -188,6 +209,15 @@ class BaseWorker(ABC):
             else:
                 logger.error(f"Failed to process job {job_id}")
                 await self._retry_or_fail(job, error_message="Job processing failed")
+
+        except asyncio.CancelledError:
+            # Cancelled by shutdown after shutdown_timeout: record it so the job is
+            # retried (within its budget) instead of lingering in the processing queue
+            logger.warning(f"Job {job_id} cancelled by worker shutdown")
+            await self._retry_or_fail(
+                job, error_message="Job cancelled by worker shutdown"
+            )
+            raise
 
         except Exception as e:
             logger.exception(f"Error processing job {job_id}: {e}")
@@ -308,16 +338,13 @@ class BaseWorker(ABC):
 
             # Check retry budget on current job snapshot
             if job.retry_count < job.max_retries:
-                import asyncio
-
                 delay = max(0.0, job.retry_delay)
-                if delay > 0.0:
-                    logger.info(
-                        f"Retrying job {job.id} in {delay}s (attempt {job.retry_count + 1}/{job.max_retries})"
-                    )
-                    await asyncio.sleep(delay)
-                # Enqueue retry (increments retry_count inside service)
-                await self.job_service.retry_job(job.id)
+                logger.info(
+                    f"Retrying job {job.id} in {delay:g}s (attempt {job.retry_count + 1}/{job.max_retries})"
+                )
+                # The delay is served from Redis (delayed set), not by sleeping here,
+                # so the worker slot is freed right away and the retry survives restarts
+                await self.job_service.retry_job(job.id, delay=delay)
             else:
                 logger.error(
                     f"Job {job.id} exhausted retries ({job.retry_count}/{job.max_retries}), kept in failed queue"
@@ -342,9 +369,15 @@ class BaseWorker(ABC):
         now = int(time.time())
         self._last_stats_log = now
         self._last_health_check = now
+        last_promote = 0.0
 
         try:
             while not self.shutdown_requested:
+                # Move delayed jobs (retries waiting out retry_delay) that are due
+                if time.time() - last_promote >= DELAYED_PROMOTE_INTERVAL:
+                    last_promote = time.time()
+                    await self.job_service.promote_due_jobs(self.queue_names)
+
                 # Check if we can process more jobs
                 if self._can_process_job():
                     # Try to get a job from queue via job service with worker_id for locking
@@ -352,6 +385,7 @@ class BaseWorker(ABC):
                         queue_names=self.queue_names,
                         timeout=0,
                         worker_id=self.worker_id,
+                        default_job_timeout=self.job_timeout,
                     )  # Non-blocking
 
                     if job:
@@ -383,6 +417,7 @@ class BaseWorker(ABC):
                 if hasattr(self, "_last_health_check"):
                     if time.time() - self._last_health_check > 30:
                         await self._health_check()
+                        await self.job_service.cleanup_stale_processing_jobs()
                         self._last_health_check = int(time.time())
                 else:
                     self._last_health_check = int(time.time())
@@ -392,27 +427,28 @@ class BaseWorker(ABC):
         except Exception as e:
             logger.exception(f"Worker {self.worker_id} error: {e}")
         finally:
-            self._shutdown()
+            await self._shutdown()
 
-    def _shutdown(self):
-        """Graceful shutdown."""
+    async def _shutdown(self):
+        """Graceful shutdown: stop taking jobs, let running ones finish, then cancel the rest."""
         logger.info(f"Shutting down aq_worker {self.worker_id}")
 
-        # Wait for running jobs to complete
-        if self.running_jobs:
-            logger.info(
-                f"Waiting for {len(self.running_jobs)} running jobs to complete..."
+        tasks = set(self._tasks)
+        if not tasks:
+            return
+
+        logger.info(
+            f"Waiting up to {self.shutdown_timeout}s for {len(tasks)} running jobs to complete..."
+        )
+        _, pending = await asyncio.wait(tasks, timeout=self.shutdown_timeout)
+
+        if pending:
+            logger.warning(
+                f"Cancelling {len(pending)} jobs still running after {self.shutdown_timeout}s"
             )
-
-            timeout = 30  # 30 seconds timeout
-            start_time = time.time()
-
-            while self.running_jobs and (time.time() - start_time) < timeout:
-                time.sleep(1)
-
-            if self.running_jobs:
-                logger.warning(
-                    f"Force shutdown with {len(self.running_jobs)} jobs still running"
-                )
-            else:
-                logger.info("All jobs completed, aq_worker shutdown complete")
+            for task in pending:
+                task.cancel()
+            # Cancelled jobs record their failure/retry before finishing
+            await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            logger.info("All jobs completed, aq_worker shutdown complete")
