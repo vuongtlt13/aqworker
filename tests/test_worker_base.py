@@ -23,6 +23,8 @@ class StubJobService:
         self.completed = []
         self.released = []
         self.retried = []
+        self.retry_delays = []
+        self.promote_calls = 0
         self.stats_calls = 0
         self.stats_value = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
 
@@ -32,12 +34,20 @@ class StubJobService:
     async def release_job_lock(self, job_id, worker_id):
         self.released.append((job_id, worker_id))
 
-    async def retry_job(self, job_id):
+    async def retry_job(self, job_id, delay=0):
         self.retried.append(job_id)
+        self.retry_delays.append(delay)
 
     async def get_queue_stats(self, queue_names):
         self.stats_calls += 1
         return self.stats_value
+
+    async def promote_due_jobs(self, queue_names):
+        self.promote_calls += 1
+        return 0
+
+    async def cleanup_stale_processing_jobs(self, max_age_seconds=300):
+        return 0
 
 
 class ConfiguredWorker(BaseWorker):
@@ -117,10 +127,10 @@ async def test_retry_or_fail_respects_retry_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_or_fail_waits_before_retry(monkeypatch):
+async def test_retry_or_fail_delegates_delay_without_sleeping(monkeypatch):
     service = StubJobService()
     worker = BaseWorker(handler_dispatcher=StubDispatcher(), job_service=service)
-    job = make_job(max_retries=3, retry_count=0, retry_delay=0.01)
+    job = make_job(max_retries=3, retry_count=0, retry_delay=60)
 
     sleep_calls = []
 
@@ -132,7 +142,124 @@ async def test_retry_or_fail_waits_before_retry(monkeypatch):
     await worker._retry_or_fail(job, "boom")
 
     assert service.retried == [job.id]
-    assert sleep_calls == [0.01]
+    assert service.retry_delays == [60]
+    assert sleep_calls == []  # worker slot is not held during retry_delay
+
+
+class SlowDispatcher:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.cancelled = False
+
+    async def execute(self, job):
+        try:
+            await asyncio.sleep(self.seconds)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return True
+
+
+@pytest.mark.asyncio
+async def test_process_job_times_out_using_job_timeout():
+    dispatcher = SlowDispatcher(5)
+    service = StubJobService()
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.job_timeout = 30
+    job = make_job(timeout=0.05, max_retries=1, retry_delay=0)
+
+    started = time.monotonic()
+    await worker._process_job_async(job)
+
+    assert time.monotonic() - started < 1
+    assert dispatcher.cancelled is True
+    assert service.completed == [(job.id, False, "Job timed out after 0.05s")]
+    assert service.retried == [job.id]
+    assert service.released == [(job.id, worker.worker_id)]
+
+
+@pytest.mark.asyncio
+async def test_process_job_falls_back_to_worker_timeout():
+    service = StubJobService()
+    worker = BaseWorker(handler_dispatcher=SlowDispatcher(5), job_service=service)
+    worker.job_timeout = 0.05
+    job = make_job(max_retries=0)
+
+    await worker._process_job_async(job)
+
+    assert service.completed == [(job.id, False, "Job timed out after 0.05s")]
+    assert service.retried == []
+
+
+@pytest.mark.asyncio
+async def test_zero_timeout_disables_limit():
+    service = StubJobService()
+    worker = BaseWorker(handler_dispatcher=SlowDispatcher(0.1), job_service=service)
+    worker.job_timeout = 0.01
+    job = make_job(timeout=0)
+
+    await worker._process_job_async(job)
+
+    assert service.completed == [(job.id, True, None)]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_running_jobs_to_finish():
+    service = StubJobService()
+    worker = BaseWorker(handler_dispatcher=SlowDispatcher(0.1), job_service=service)
+    worker.shutdown_timeout = 2
+    task = asyncio.create_task(worker._process_job_async(make_job(timeout=0)))
+    worker._tasks.add(task)
+
+    await worker._shutdown()
+
+    assert task.done() and not task.cancelled()
+    assert service.completed == [("job-1", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_jobs_after_timeout_and_records_retry():
+    dispatcher = SlowDispatcher(10)
+    service = StubJobService()
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.shutdown_timeout = 0.05
+    job = make_job(timeout=0, max_retries=2, retry_delay=0)
+    task = asyncio.create_task(worker._process_job_async(job))
+    worker._tasks.add(task)
+    await asyncio.sleep(0)  # let the job start
+
+    started = time.monotonic()
+    await worker._shutdown()
+
+    assert time.monotonic() - started < 1
+    assert dispatcher.cancelled is True
+    assert service.completed == [(job.id, False, "Job cancelled by worker shutdown")]
+    assert service.retried == [job.id]
+    assert service.released == [(job.id, worker.worker_id)]
+
+
+@pytest.mark.asyncio
+async def test_signal_stops_run_and_waits_for_running_job():
+    service = StubJobService()
+    jobs = [make_job(timeout=0)]
+
+    async def fake_get_next_job(**kwargs):
+        return jobs.pop() if jobs else None
+
+    service.get_next_job = fake_get_next_job  # type: ignore[assignment]
+    dispatcher = SlowDispatcher(0.2)
+    worker = BaseWorker(handler_dispatcher=dispatcher, job_service=service)
+    worker.poll_interval = 0.01
+
+    async def stop_soon():
+        await asyncio.sleep(0.05)
+        worker._signal_handler(15, None)
+
+    await asyncio.gather(worker.run(), stop_soon())
+
+    assert dispatcher.cancelled is False
+    assert service.completed == [("job-1", True, None)]
+    assert service.promote_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -260,7 +387,9 @@ async def test_run_processes_jobs_concurrently(monkeypatch):
     job1 = make_job(id="job-1")
     job2 = make_job(id="job-2")
 
-    async def fake_get_next_job(queue_names, timeout=0, worker_id=None):
+    async def fake_get_next_job(
+        queue_names, timeout=0, worker_id=None, default_job_timeout=None
+    ):
         # First call -> job1, second call -> job2, then no more jobs
         call_count = getattr(fake_get_next_job, "call_count", 0)
         call_count += 1
@@ -315,17 +444,3 @@ async def test_run_processes_jobs_concurrently(monkeypatch):
 
     # Both jobs should have been processed
     assert {j[0] for j in service.completed} == {"job-1", "job-2"}
-
-
-def test_shutdown_waits_for_running_jobs(monkeypatch):
-    worker = BaseWorker(
-        handler_dispatcher=StubDispatcher(), job_service=StubJobService()
-    )
-    worker.running_jobs = {"job-1"}
-
-    def fake_sleep(seconds):
-        worker.running_jobs.clear()
-
-    monkeypatch.setattr(time, "sleep", fake_sleep)
-    worker._shutdown()
-    assert worker.running_jobs == set()

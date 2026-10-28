@@ -8,12 +8,26 @@ from aqworker.constants import (
     FAILED_QUEUE,
     JOB_QUEUE_PREFIX,
     PROCESSING_QUEUE,
+    STALE_JOB_GRACE,
+    STALE_JOB_MIN_AGE,
+    get_delayed_queue_name,
     get_job_lock_key,
     get_job_status_key,
     get_queue_name,
 )
 from aqworker.job.models import JobModel, JobStatus, JobStatusInfo
 from aqworker.logger import logger
+
+# Move due members of a delayed sorted set into its queue list (LPUSH, same as enqueue).
+# KEYS[1] = delayed zset, KEYS[2] = queue list; ARGV[1] = now (epoch), ARGV[2] = batch size
+PROMOTE_DUE_JOBS_SCRIPT = """
+local due = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2])
+for _, member in ipairs(due) do
+    redis.call("ZREM", KEYS[1], member)
+    redis.call("LPUSH", KEYS[2], member)
+end
+return #due
+"""
 
 
 class JobQueue:
@@ -83,8 +97,71 @@ class JobQueue:
             logger.error(f"Failed to enqueue job {job.id}: {e}")
             return False
 
+    async def schedule(self, job: JobModel, run_at: datetime) -> bool:
+        """
+        Add job to the delayed set of its queue; it becomes pending at run_at.
+
+        Args:
+            job: Job to schedule
+            run_at: Time when the job should be moved to its queue
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            job_data = job.model_dump_json()
+            await self.redis_client.zadd(
+                get_delayed_queue_name(job.queue_name), {job_data: run_at.timestamp()}
+            )
+            await self.redis_client.hset(
+                get_job_status_key(job.id),
+                mapping={
+                    "status": job.status.value,
+                    "created_at": job.created_at.isoformat(),
+                    "data": job_data,
+                },
+            )
+            logger.info(
+                f"Scheduled job {job.id} on queue {job.queue_name} at {run_at.isoformat()}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to schedule job {job.id}: {e}")
+            return False
+
+    async def promote_due_jobs(self, queue_names: List[str], batch: int = 100) -> int:
+        """
+        Move delayed jobs whose run-at time has passed into their queues.
+
+        Atomic per queue, so several workers can call it concurrently.
+
+        Returns:
+            Number of jobs moved
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        moved = 0
+        for queue_name in queue_names:
+            try:
+                moved += int(
+                    await self.redis_client.eval(
+                        PROMOTE_DUE_JOBS_SCRIPT,
+                        2,
+                        get_delayed_queue_name(queue_name),
+                        self._get_queue_name(queue_name),
+                        now,
+                        batch,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Failed to promote delayed jobs of {queue_name}: {e}")
+        return moved
+
     async def dequeue(
-        self, queue_names: List[str], timeout: int = 0, worker_id: Optional[str] = None
+        self,
+        queue_names: List[str],
+        timeout: int = 0,
+        worker_id: Optional[str] = None,
+        default_job_timeout: Optional[float] = None,
     ) -> Optional[JobModel]:
         """
         Get next job from queue (FIFO) using atomic operations to prevent race conditions.
@@ -93,6 +170,8 @@ class JobQueue:
             queue_names: List of queue names to check for jobs
             timeout: Blocking timeout in seconds (0 = no blocking)
             worker_id: Worker identifier for job locking
+            default_job_timeout: Execution timeout stamped on jobs that have none,
+                so stale detection knows how long the job may legitimately run
 
         Returns:
             Job or None if no jobs available
@@ -135,6 +214,8 @@ class JobQueue:
                     # Update job status atomically
                     job.status = JobStatus.PROCESSING
                     job.started_at = datetime.now(timezone.utc)
+                    if job.timeout is None and default_job_timeout is not None:
+                        job.timeout = default_job_timeout
 
                     # Update job status in Redis
                     await self.redis_client.hset(
@@ -458,29 +539,28 @@ class JobQueue:
             await self._cleanup_old_entries(self.completed_queue, 120)
             await self._cleanup_old_entries(self.failed_queue, 120)
 
-            # Clean up stale processing jobs (>5 minutes)
-            stale_removed = await self.cleanup_stale_processing_jobs(300)
-            if stale_removed > 0:
-                logger.info(
-                    f"Cleaned up {stale_removed} stale processing jobs during stats collection"
-                )
-
             stats: Dict[str, Any] = {}
 
             # Count jobs in all queues
             if queue_names:
                 # Count jobs in specified queues
                 total_pending = 0
+                total_delayed = 0
                 for queue_name in queue_names:
                     queue_key = self._get_queue_name(queue_name)
                     count = await self.redis_client.llen(queue_key)
                     total_pending += count
+                    total_delayed += await self.redis_client.zcard(
+                        get_delayed_queue_name(queue_name)
+                    )
                 stats["pending"] = total_pending
+                stats["delayed"] = total_delayed
             else:
                 # Default behavior - count all known queues
                 # If no queue_names provided, we can't determine pending count
                 # This should not happen in normal operation
                 stats["pending"] = 0
+                stats["delayed"] = 0
 
             stats["processing"] = await self.redis_client.llen(self.processing_queue)
             stats["completed"] = await self.redis_client.llen(self.completed_queue)
@@ -547,12 +627,20 @@ class JobQueue:
             # Best-effort cleanup; never raise
             logger.debug(f"Cleanup on {queue_key} failed: {e}")
 
-    async def cleanup_stale_processing_jobs(self, max_age_seconds: int = 300) -> int:
+    async def cleanup_stale_processing_jobs(
+        self, max_age_seconds: int = STALE_JOB_MIN_AGE
+    ) -> int:
         """
-        Clean up stale jobs from processing queue that have been stuck for too long.
+        Drop jobs stuck in the processing queue, e.g. because their worker died.
+
+        A job is stale once it has been processing longer than max_age_seconds,
+        or longer than its own timeout plus a grace period when that is larger.
+        Jobs with timeout disabled (0) are never considered stale. Stale jobs are
+        marked FAILED and moved to the failed queue; they are NOT retried, the
+        application decides whether to re-enqueue them.
 
         Args:
-            max_age_seconds: Maximum age for processing jobs (default 5 minutes)
+            max_age_seconds: Minimum processing age before a job is stale
 
         Returns:
             Number of stale jobs removed
@@ -564,30 +652,53 @@ class JobQueue:
             if not processing_jobs:
                 return 0
 
-            threshold = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+            now = datetime.now(timezone.utc)
             removed_count = 0
-            stale_job_ids = []
+            stale_jobs: List[JobModel] = []
 
             # First pass: identify stale jobs
             for processing_job in processing_jobs:
                 try:
                     job = JobModel.model_validate_json(processing_job)
-                    # Check if job has been in processing for too long
-                    if job.started_at and job.started_at < threshold:
-                        stale_job_ids.append(job.id)
-                        logger.warning(
-                            f"Found stale processing job {job.id} (started at {job.started_at})"
-                        )
                 except Exception as e:
                     # Skip malformed entries
                     logger.debug(f"Skipping malformed job in processing queue: {e}")
                     continue
+                if not job.started_at or job.timeout == 0:
+                    continue
+                max_age = max(
+                    float(max_age_seconds), (job.timeout or 0) + STALE_JOB_GRACE
+                )
+                if job.started_at < now - timedelta(seconds=max_age):
+                    stale_jobs.append(job)
+                    logger.warning(
+                        f"Found stale processing job {job.id} (handler={job.handler}, "
+                        f"started at {job.started_at}), dropping without retry"
+                    )
 
-            # Second pass: remove stale jobs by ID
-            for job_id in stale_job_ids:
-                removed = await self._remove_job_from_processing_queue_by_id(job_id)
-                if removed:
-                    removed_count += 1
+            # Second pass: remove stale jobs by ID and record them as failed
+            for job in stale_jobs:
+                removed = await self._remove_job_from_processing_queue_by_id(job.id)
+                if not removed:
+                    continue
+                removed_count += 1
+                error_message = (
+                    f"Stale: still processing after "
+                    f"{(now - job.started_at).total_seconds():.0f}s, worker presumed dead"
+                )
+                job.status = JobStatus.FAILED
+                job.completed_at = now
+                job.error_message = error_message
+                await self.redis_client.lpush(self.failed_queue, job.model_dump_json())
+                await self.redis_client.hset(
+                    get_job_status_key(job.id),
+                    mapping={
+                        "status": job.status.value,
+                        "completed_at": now.isoformat(),
+                        "error_message": error_message,
+                        "data": job.model_dump_json(),
+                    },
+                )
 
             if removed_count > 0:
                 logger.info(f"Cleaned up {removed_count} stale processing jobs")

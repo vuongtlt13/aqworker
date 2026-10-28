@@ -54,6 +54,7 @@ class DummyQueue:
         self.failed_queue = "failed"
         self.jobs = {}
         self.enqueued_jobs = []
+        self.scheduled = []
         self.stats_args = None
         self.dequeued_args = None
         self.next_job = None
@@ -89,9 +90,14 @@ class DummyQueue:
         self.stats_args = queue_names
         return {"pending": len(self.jobs)}
 
-    async def dequeue(self, queue_names, timeout, worker_id):
+    async def dequeue(self, queue_names, timeout, worker_id, default_job_timeout=None):
         self.dequeued_args = (queue_names, timeout, worker_id)
         return self.next_job
+
+    async def schedule(self, job, run_at):
+        self.jobs[job.id] = job
+        self.scheduled.append((job.id, run_at))
+        return True
 
     async def complete_job(self, job, success, error_message=None):
         self.completed = (job.id, success, error_message)
@@ -218,6 +224,39 @@ async def test_retry_job_enqueues_failed(job_service):
 
     assert await service.retry_job(job.id) is True
     assert queue.enqueued_jobs.count(job.id) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_job_with_delay_schedules_instead_of_enqueue(job_service):
+    service, queue = job_service
+    job = await service.enqueue_job("tasks", "handler")
+    job.status = JobStatus.FAILED
+    queue.jobs[job.id] = job
+
+    before = datetime.now(timezone.utc)
+    assert await service.retry_job(job.id, delay=60) is True
+
+    assert queue.enqueued_jobs.count(job.id) == 1  # only the original enqueue
+    [(scheduled_id, run_at)] = queue.scheduled
+    assert scheduled_id == job.id
+    assert run_at >= before + timedelta(seconds=60)
+    assert queue.jobs[job.id].retry_count == 1
+
+
+class TimedHandler(BaseHandler):
+    name = "timed-handler"
+    queue_name = "tasks"
+    timeout = 5
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_timeout_defaults_to_handler_and_can_be_overridden(
+    job_service,
+):
+    service, _ = job_service
+    assert (await service.enqueue_job(TimedHandler)).timeout == 5
+    assert (await service.enqueue_job(TimedHandler, timeout=0)).timeout == 0
+    assert (await service.enqueue_job("plain", queue_name="tasks")).timeout is None
 
 
 @pytest.mark.asyncio

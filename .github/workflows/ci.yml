@@ -58,6 +58,16 @@ jobs:
       - name: Sync runtime dependencies
         run: uv sync --frozen
 
+      - name: Check release tag matches package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "${TAG#v}" != "$VERSION" ]; then
+            echo "Release tag $TAG does not match pyproject.toml version $VERSION; bump the version first."
+            exit 1
+          fi
+
       - name: Build artifacts
         run: uv build
 
