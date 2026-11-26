@@ -26,6 +26,10 @@ DELAYED_PROMOTE_INTERVAL = 1.0  # Seconds between moves of due delayed jobs
 STALE_JOB_MIN_AGE = 300  # Processing jobs older than this are considered stale
 STALE_JOB_GRACE = 60  # Extra seconds on top of a job's own timeout before stale
 
+# Seconds a finished job's status hash (aqw:job:<id>) is kept before Redis expires it.
+# Without a TTL these hashes pile up forever (one per job run, cron jobs included).
+DEFAULT_JOB_RESULT_TTL = 24 * 60 * 60
+
 
 # Queue name patterns
 def get_queue_name(queue_name: str) -> str:

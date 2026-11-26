@@ -103,6 +103,9 @@ class DummyQueue:
         self.completed = (job.id, success, error_message)
         return True
 
+    async def set_status(self, job_id, mapping, finished):
+        await self.redis_client.hset(get_job_status_key(job_id), mapping=mapping)
+
     async def cleanup_stale_processing_jobs(self, max_age_seconds):
         self.cleaned_age = max_age_seconds
         return 3

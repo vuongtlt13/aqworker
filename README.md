@@ -70,6 +70,10 @@ AQWorker is a Redis-based background job processing system for Python applicatio
   - Get job status
   - Queue statistics
   - Job lifecycle management
+  - Finished job status (`aqw:job:<id>`) expires after `result_ttl` seconds
+    (default 1 day, `JobService(result_ttl=...)` / `AQWorker(result_ttl=...)`;
+    `None` keeps it forever). Before 0.1.10 these hashes were never removed and
+    grew by one key per job run, cron jobs included.
 
 ### 5. JobQueue (`job/queue.py`)
 - **Purpose**: Low-level Redis operations for job management

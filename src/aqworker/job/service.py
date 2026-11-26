@@ -2,7 +2,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Type, Union
 
-from aqworker.constants import STALE_JOB_MIN_AGE, get_job_status_key
+from aqworker.constants import (
+    DEFAULT_JOB_RESULT_TTL,
+    STALE_JOB_MIN_AGE,
+    get_job_status_key,
+)
 from aqworker.handler.base import BaseHandler
 from aqworker.job.base import CronJob, Job
 from aqworker.job.models import JobCreateRequest, JobModel, JobStatus, JobStatusInfo
@@ -14,11 +18,22 @@ class JobService:
     """Background job service for managing jobs."""
 
     def __init__(
-        self, redis_host: str = "localhost", redis_port: int = 6379, redis_db: int = 0
+        self,
+        redis_host: str = "localhost",
+        redis_port: int = 6379,
+        redis_db: int = 0,
+        result_ttl: Optional[int] = DEFAULT_JOB_RESULT_TTL,
     ):
-        """Initialize job service using environment configuration or overrides."""
+        """
+        Initialize job service using environment configuration or overrides.
+
+        Args:
+            result_ttl: Seconds to keep a finished job's status hash in Redis
+                (default 1 day); None or 0 keeps it forever
+        """
         self.redis_db = redis_db
         self.redis_url = f"redis://{redis_host}:{redis_port}/{redis_db}"
+        self.result_ttl = result_ttl
 
         # Single queue instance for all operations
         self._queue: Optional[JobQueue] = None
@@ -31,7 +46,7 @@ class JobService:
             JobQueue instance
         """
         if self._queue is None:
-            self._queue = JobQueue(redis_url=self.redis_url)
+            self._queue = JobQueue(redis_url=self.redis_url, result_ttl=self.result_ttl)
         return self._queue
 
     async def _create_job(self, request: JobCreateRequest) -> JobModel:
@@ -247,15 +262,16 @@ class JobService:
         job.status = JobStatus.CANCELLED
         job.completed_at = datetime.now(timezone.utc)
 
-        # Update in Redis
+        # Update in Redis; expires after result_ttl like other finished jobs
         queue = self._get_queue()  # Service queue for general operations
-        await queue.redis_client.hset(
-            get_job_status_key(job_id),
-            mapping={
+        await queue.set_status(
+            job_id,
+            {
                 "status": job.status.value,
                 "completed_at": job.completed_at.isoformat(),
                 "data": job.model_dump_json(),  # Update data field to keep it in sync
             },
+            finished=True,
         )
 
         logger.info(f"Cancelled job {job_id}")

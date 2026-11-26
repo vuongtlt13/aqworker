@@ -5,6 +5,7 @@ import redis.asyncio as redis
 
 from aqworker.constants import (
     COMPLETED_QUEUE,
+    DEFAULT_JOB_RESULT_TTL,
     FAILED_QUEUE,
     JOB_QUEUE_PREFIX,
     PROCESSING_QUEUE,
@@ -33,21 +34,45 @@ return #due
 class JobQueue:
     """Redis-based job queue implementation."""
 
-    def __init__(self, redis_url: str):
+    def __init__(
+        self, redis_url: str, result_ttl: Optional[int] = DEFAULT_JOB_RESULT_TTL
+    ):
         """
         Initialize job queue with Redis connection.
 
         Args:
             redis_url: Redis connection URL. Example: redis://localhost:6379/0
+            result_ttl: Seconds to keep a finished job's status hash; None or 0
+                keeps it forever (the hashes then grow without bound)
         """
         # Store URL for lazy connection
         self.redis_url = redis_url
         self._redis_client = redis.from_url(self.redis_url, decode_responses=True)
         self.queue_prefix = JOB_QUEUE_PREFIX
+        self.result_ttl = result_ttl
 
         self.processing_queue = PROCESSING_QUEUE
         self.completed_queue = COMPLETED_QUEUE
         self.failed_queue = FAILED_QUEUE
+
+    async def set_status(
+        self, job_id: str, mapping: Dict[str, Any], finished: bool
+    ) -> None:
+        """
+        Write a job's status hash.
+
+        A finished job (completed/failed/cancelled) gets result_ttl so Redis drops
+        it later; a pending one has any earlier TTL removed, so a job re-enqueued
+        for retry keeps its status while it waits.
+        """
+        key = get_job_status_key(job_id)
+        async with self.redis_client.pipeline(transaction=True) as pipe:
+            pipe.hset(key, mapping=mapping)
+            if finished and self.result_ttl:
+                pipe.expire(key, self.result_ttl)
+            elif not finished:
+                pipe.persist(key)
+            await pipe.execute()
 
     @property
     def redis_client(self):
@@ -81,13 +106,14 @@ class JobQueue:
             await self.redis_client.lpush(queue_name, job_data)
 
             # Set job status
-            await self.redis_client.hset(
-                get_job_status_key(job.id),
-                mapping={
+            await self.set_status(
+                job.id,
+                {
                     "status": job.status.value,
                     "created_at": job.created_at.isoformat(),
                     "data": job_data,
                 },
+                finished=False,
             )
 
             logger.info(f"Enqueued job {job.id} to queue {job.queue_name}")
@@ -113,13 +139,14 @@ class JobQueue:
             await self.redis_client.zadd(
                 get_delayed_queue_name(job.queue_name), {job_data: run_at.timestamp()}
             )
-            await self.redis_client.hset(
-                get_job_status_key(job.id),
-                mapping={
+            await self.set_status(
+                job.id,
+                {
                     "status": job.status.value,
                     "created_at": job.created_at.isoformat(),
                     "data": job_data,
                 },
+                finished=False,
             )
             logger.info(
                 f"Scheduled job {job.id} on queue {job.queue_name} at {run_at.isoformat()}"
@@ -414,15 +441,16 @@ class JobQueue:
                 # Move to failed queue
                 await self.redis_client.lpush(self.failed_queue, job.model_dump_json())
 
-            # Update job status and data field
-            await self.redis_client.hset(
-                get_job_status_key(job.id),
-                mapping={
+            # Update job status and data field; expires after result_ttl
+            await self.set_status(
+                job.id,
+                {
                     "status": job.status.value,
                     "completed_at": job.completed_at.isoformat(),
                     "error_message": error_message or "",
                     "data": job.model_dump_json(),  # Update data field to keep it in sync
                 },
+                finished=True,
             )
 
             # Remove from processing queue using job ID
@@ -690,14 +718,15 @@ class JobQueue:
                 job.completed_at = now
                 job.error_message = error_message
                 await self.redis_client.lpush(self.failed_queue, job.model_dump_json())
-                await self.redis_client.hset(
-                    get_job_status_key(job.id),
-                    mapping={
+                await self.set_status(
+                    job.id,
+                    {
                         "status": job.status.value,
                         "completed_at": now.isoformat(),
                         "error_message": error_message,
                         "data": job.model_dump_json(),
                     },
+                    finished=True,
                 )
 
             if removed_count > 0:

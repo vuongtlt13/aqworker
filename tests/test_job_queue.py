@@ -139,6 +139,43 @@ async def test_complete_job_moves_payload(redis_client):
     assert await redis_client.llen(queue.processing_queue) == 0
 
 
+async def test_finished_job_status_expires_after_result_ttl(redis_client):
+    queue = JobQueue("redis://localhost:6379/0", result_ttl=600)
+    queue.redis_client = redis_client
+
+    job = make_job()
+    assert await queue.enqueue(job) is True
+    key = get_job_status_key(job.id)
+    assert await redis_client.ttl(key) == -1  # pending: no expiry
+
+    assert await queue.complete_job(job, success=True) is True
+    assert 0 < await redis_client.ttl(key) <= 600
+
+    # Re-enqueued for retry: pending again, expiry removed
+    assert await queue.enqueue(job) is True
+    assert await redis_client.ttl(key) == -1
+
+
+async def test_failed_job_status_expires(redis_client):
+    queue = JobQueue("redis://localhost:6379/0", result_ttl=600)
+    queue.redis_client = redis_client
+
+    job = make_job()
+    await queue.enqueue(job)
+    assert await queue.complete_job(job, success=False, error_message="x") is True
+    assert 0 < await redis_client.ttl(get_job_status_key(job.id)) <= 600
+
+
+async def test_result_ttl_none_keeps_status_forever(redis_client):
+    queue = JobQueue("redis://localhost:6379/0", result_ttl=None)
+    queue.redis_client = redis_client
+
+    job = make_job()
+    await queue.enqueue(job)
+    assert await queue.complete_job(job, success=True) is True
+    assert await redis_client.ttl(get_job_status_key(job.id)) == -1
+
+
 async def test_complete_job_handles_failure(redis_client):
     queue = JobQueue("redis://localhost:6379/0")
     queue.redis_client = redis_client

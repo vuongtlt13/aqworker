@@ -7,6 +7,7 @@ import inspect
 import pkgutil
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Type, Union
 
+from aqworker.constants import DEFAULT_JOB_RESULT_TTL
 from aqworker.handler.base import BaseHandler
 from aqworker.handler.registry import HandlerRegistry
 from aqworker.job.base import CronJob, Job
@@ -35,6 +36,7 @@ class AQWorker:
         redis_port: int = 6379,
         redis_db: int = 0,
         include_packages: Optional[Iterable[str]] = None,
+        result_ttl: Optional[int] = DEFAULT_JOB_RESULT_TTL,
     ):
         """
         Initialize AQWorker with registries and job service.
@@ -51,11 +53,17 @@ class AQWorker:
                       Only used when job_service is not provided.
             include_packages: Optional iterable of package/module names to import
                                for handler auto-discovery.
+            result_ttl: Seconds to keep a finished job's status hash in Redis
+                        (default 1 day); None or 0 keeps it forever.
+                        Only used when job_service is not provided.
         """
         self.worker_registry = worker_registry or WorkerRegistry()
         self.handler_registry = handler_registry or HandlerRegistry()
         self.job_service: Optional[JobService] = job_service or JobService(
-            redis_host=redis_host, redis_port=redis_port, redis_db=redis_db
+            redis_host=redis_host,
+            redis_port=redis_port,
+            redis_db=redis_db,
+            result_ttl=result_ttl,
         )
         self.handler_dispatcher = HandlerDispatcher(self.handler_registry)
         self._workers: Dict[str, Optional[Type["BaseWorker"]]] = {}
